@@ -23,45 +23,49 @@ env:
 jobs:
   pc:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: azure/login@v2
         with:
-          client-id: ${{ vars.AZURE_CLIENT_ID }}
-          tenant-id: ${{ vars.AZURE_TENANT_ID }}
-          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZ_CLIENT_ID || vars.AZ_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZ_TENANT_ID || vars.AZ_TENANT_ID }}
+          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID || vars.AZ_SUBSCRIPTION_ID }}
       - name: Criar o PC (VM real no Azure)
         id: criar
         if: inputs.acao == 'criar'
         env:
-          TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
+          AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           TAM: ${{ inputs.tamanho }}
         run: |
           set -euo pipefail
-          TOKEN=$(curl -sf -d "client_id=$TS_ID" -d "client_secret=$TS_SECRET" -d grant_type=client_credentials https://api.tailscale.com/api/v2/oauth/token | jq -r .access_token)
-          KEY=$(curl -sf -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-            -d '{"expirySeconds":1800,"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":false,"preauthorized":true,"tags":["tag:gamer"]}}}}' \
-            https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
-          echo "::add-mask::$KEY"
+          if [ -z "$AUTHKEY" ]; then
+            echo "::error::O segredo TAILSCALE_AUTH_KEY nao existe ou esta vazio."
+            exit 1
+          fi
+          echo "::add-mask::$AUTHKEY"
           # Senha NAO e mascarada de proposito: ela aparece no resumo final
           PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
           echo "pw=$PW" >> "$GITHUB_OUTPUT"
-          sed -e "s|__AUTHKEY__|$KEY|" -e "s|__HOSTNAME__|$VM|" -e "s|__ADMINPASS__|$PW|" -e "s|__USUARIO__|$USUARIO|g" scripts/primeiro-boot.ps1 > /tmp/boot.ps1
           az group create -n "$RG" -l "$LOC" -o none
+          # O script vai em custom-data SEM nenhum segredo dentro
           az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
             --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
             --admin-username "$USUARIO" --admin-password "$PW" \
             --os-disk-size-gb 240 --storage-sku Premium_LRS --license-type Windows_Client \
-            --public-ip-sku Standard --nsg-rule NONE --custom-data /tmp/boot.ps1 -o none
+            --public-ip-sku Standard --nsg-rule NONE \
+            --custom-data scripts/primeiro-boot.ps1 -o none
           if [[ "$TAM" == *NV* ]]; then
             az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
               --name NvidiaGpuDriverWindows --version 1.6 -o none
           fi
+          # A chave e a senha vao em protected-settings (criptografado, nao aparece em logs nem no portal)
+          CMD="powershell -ExecutionPolicy Bypass -Command \"Copy-Item C:\\AzureData\\CustomData.bin C:\\setup.ps1 -Force; & C:\\setup.ps1 -AuthKey '$AUTHKEY' -NomePC '$VM' -Usuario '$USUARIO' -Senha '$PW'\""
+          PS=$(jq -nc --arg c "$CMD" '{commandToExecute:$c}')
+          echo "::add-mask::$PS"
           az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.Compute \
             --name CustomScriptExtension --version 1.10 \
-            --protected-settings '{"commandToExecute":"powershell -ExecutionPolicy Bypass -Command \"Copy-Item C:\\AzureData\\CustomData.bin C:\\setup.ps1 -Force; & C:\\setup.ps1\""}' -o none
+            --protected-settings "$PS" -o none
       - name: Ligar, desligar, reiniciar ou destruir
         if: contains('ligar desligar reiniciar destruir', inputs.acao)
         env:
@@ -76,32 +80,32 @@ jobs:
       - name: CONECTAR ANDROID (aguarda o Tailscale e mostra os dados)
         if: inputs.acao == 'criar' || inputs.acao == 'status' || inputs.acao == 'ligar' || inputs.acao == 'reiniciar'
         env:
-          TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           ACAO: ${{ inputs.acao }}
           SENHA: ${{ steps.criar.outputs.pw }}
         run: |
-          TOKEN=$(curl -sf -d "client_id=$TS_ID" -d "client_secret=$TS_SECRET" -d grant_type=client_credentials https://api.tailscale.com/api/v2/oauth/token | jq -r .access_token)
-          D='{}'
-          for i in $(seq 1 85); do
-            X=$(curl -sf -H "Authorization: Bearer $TOKEN" https://api.tailscale.com/api/v2/tailnet/-/devices \
-              | jq -c '[.devices[] | select(.hostname|ascii_downcase=="gamerpc")][0] // {}' || echo '{}')
-            [ -n "$X" ] && D="$X"
-            [ "$(echo "$D" | jq -r '.connectedToControl // false')" = true ] && break
-            [ "$ACAO" = status ] && break
-            sleep 20
+          IP=""
+          STATE="nao criada"
+          TENTATIVAS=40
+          [ "$ACAO" = status ] && TENTATIVAS=1
+          for i in $(seq 1 "$TENTATIVAS"); do
+            STATE=$(az vm get-instance-view -g "$RG" -n "$VM" --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv 2>/dev/null || echo "nao criada")
+            if [ "$STATE" = "VM running" ]; then
+              OUT=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+                --scripts '$j = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json; if ($j.BackendState -eq "Running") { & "C:\Program Files\Tailscale\tailscale.exe" ip -4 }' \
+                -o json 2>/dev/null || true)
+              IP=$(echo "$OUT" | jq -r '.value[0].message // ""' 2>/dev/null | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+              [ -n "$IP" ] && break
+            fi
+            [ "$i" -lt "$TENTATIVAS" ] && sleep 20
           done
-          STATE=$(az vm get-instance-view -g "$RG" -n "$VM" --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv 2>/dev/null || echo "nao criada")
-          IP=$(echo "$D" | jq -r '.addresses[0] // "ainda sem IP"')
-          NOME=$(echo "$D" | jq -r '.hostname // "gamerpc"')
-          ON=$(echo "$D" | jq -r 'if .connectedToControl then "Conectado" else "Desconectado" end')
+          if [ -n "$IP" ]; then ON="Conectado"; else ON="Desconectado"; IP="ainda sem IP"; fi
           {
             echo "## CONECTAR ANDROID"
             echo "| Item | Valor |"; echo "|---|---|"
             echo "| Estado da VM | $STATE |"
             echo "| Tailscale | $ON |"
-            echo "| IP privado | \`$IP\` |"
-            echo "| Nome do PC | \`$NOME\` |"
+            echo "| IP privado Tailscale | \`$IP\` |"
+            echo "| Nome do PC | \`$VM\` |"
             echo "| Sunshine | https://$IP:47990 |"
             echo ""
             echo "1. No Android, instale o **Tailscale** e entre na mesma conta."
@@ -117,6 +121,7 @@ jobs:
               echo "| Senha | definida na criação do PC (veja a execução da ação criar) |"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "Tailscale: $ON | IP: $IP"
           echo "Conta: $USUARIO"
           [ -n "$SENHA" ] && echo "Senha: $SENHA" || true
           
