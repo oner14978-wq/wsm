@@ -14,9 +14,11 @@ on:
         default: Standard_NV6ads_A10_v5
 permissions:
   contents: read
+  id-token: write
 env:
   RG: gamerpc-rg
   VM: gamerpc
+  USUARIO: Rafael
   LOC: ${{ vars.AZ_LOCATION || 'eastus' }}
 jobs:
   pc:
@@ -26,8 +28,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Criar o PC (VM real no Azure)
+        id: criar
         if: inputs.acao == 'criar'
         env:
           TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -40,13 +45,14 @@ jobs:
             -d '{"expirySeconds":1800,"capabilities":{"devices":{"create":{"reusable":false,"ephemeral":false,"preauthorized":true,"tags":["tag:gamer"]}}}}' \
             https://api.tailscale.com/api/v2/tailnet/-/keys | jq -r .key)
           echo "::add-mask::$KEY"
+          # Senha NAO e mascarada de proposito: ela aparece no resumo final
           PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
-          echo "::add-mask::$PW"
-          sed -e "s|__AUTHKEY__|$KEY|" -e "s|__HOSTNAME__|$VM|" -e "s|__ADMINPASS__|$PW|" scripts/primeiro-boot.ps1 > /tmp/boot.ps1
+          echo "pw=$PW" >> "$GITHUB_OUTPUT"
+          sed -e "s|__AUTHKEY__|$KEY|" -e "s|__HOSTNAME__|$VM|" -e "s|__ADMINPASS__|$PW|" -e "s|__USUARIO__|$USUARIO|g" scripts/primeiro-boot.ps1 > /tmp/boot.ps1
           az group create -n "$RG" -l "$LOC" -o none
           az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
             --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
-            --admin-username gamer --admin-password "$PW" \
+            --admin-username "$USUARIO" --admin-password "$PW" \
             --os-disk-size-gb 240 --storage-sku Premium_LRS --license-type Windows_Client \
             --public-ip-sku Standard --nsg-rule NONE --custom-data /tmp/boot.ps1 -o none
           if [[ "$TAM" == *NV* ]]; then
@@ -73,6 +79,7 @@ jobs:
           TS_ID: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           TS_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           ACAO: ${{ inputs.acao }}
+          SENHA: ${{ steps.criar.outputs.pw }}
         run: |
           TOKEN=$(curl -sf -d "client_id=$TS_ID" -d "client_secret=$TS_SECRET" -d grant_type=client_credentials https://api.tailscale.com/api/v2/oauth/token | jq -r .access_token)
           D='{}'
@@ -100,4 +107,16 @@ jobs:
             echo "1. No Android, instale o **Tailscale** e entre na mesma conta."
             echo "2. Instale o **Moonlight** e adicione o PC pelo IP acima."
             echo "3. No navegador, abra o endereço do Sunshine, crie o usuário e digite o PIN do Moonlight."
+            echo ""
+            echo "## CONTA WINDOWS"
+            echo "| Item | Valor |"; echo "|---|---|"
+            echo "| Conta | \`$USUARIO\` |"
+            if [ -n "$SENHA" ]; then
+              echo "| Senha | \`$SENHA\` |"
+            else
+              echo "| Senha | definida na criação do PC (veja a execução da ação criar) |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "Conta: $USUARIO"
+          [ -n "$SENHA" ] && echo "Senha: $SENHA" || true
+          
