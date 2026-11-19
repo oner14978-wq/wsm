@@ -46,8 +46,15 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          echo "ABRA https://microsoft.com/devicelogin e digite o codigo que aparecer abaixo:"
-          az login --use-device-code -o none
+          # Ate 3 tentativas: cada codigo vale ~15 minutos. Abra o link que aparecer e digite o codigo.
+          logado=0
+          for t in 1 2 3; do
+            echo "::notice title=Login Azure::Tentativa $t de 3 - abra o link e digite o codigo mostrado neste passo"
+            echo ">>> TENTATIVA $t de 3: abra o link abaixo e digite o codigo que aparecer <<<"
+            if az login --use-device-code -o none; then logado=1; break; fi
+            echo "Codigo expirou sem login. Gerando outro..."
+          done
+          [ "$logado" = 1 ] || { echo "::error::Login no Azure nao concluido. Rode a acao de novo e entre no link logo que o codigo aparecer."; exit 1; }
           SUB=$(az account show --query id -o tsv)
           TEN=$(az account show --query tenantId -o tsv)
           NAME=gamerpc-gh
