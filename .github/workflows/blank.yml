@@ -20,17 +20,77 @@ env:
   VM: gamerpc
   USUARIO: Rafael
   LOC: ${{ vars.AZ_LOCATION || 'eastus' }}
+  REPO: ${{ github.repository }}
+  BRANCH: ${{ github.ref_name }}
+  AZ_CID: ${{ secrets.AZ_CLIENT_ID || vars.AZ_CLIENT_ID }}
+  AZ_TID: ${{ secrets.AZ_TENANT_ID || vars.AZ_TENANT_ID }}
+  AZ_SID: ${{ secrets.AZ_SUBSCRIPTION_ID || vars.AZ_SUBSCRIPTION_ID }}
 jobs:
   pc:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: azure/login@v2
+      # ---- LOGIN NO AZURE: usa AZ_* se existirem ----
+      - name: Login Azure (AZ_CLIENT_ID, AZ_TENANT_ID, AZ_SUBSCRIPTION_ID)
+        if: env.AZ_CID != '' && env.AZ_TID != ''
+        uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZ_CLIENT_ID || vars.AZ_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZ_TENANT_ID || vars.AZ_TENANT_ID }}
-          subscription-id: ${{ secrets.AZ_SUBSCRIPTION_ID || vars.AZ_SUBSCRIPTION_ID }}
+          client-id: ${{ env.AZ_CID }}
+          tenant-id: ${{ env.AZ_TID }}
+          subscription-id: ${{ env.AZ_SID }}
+
+      # ---- SEM AZ_*: faz login por codigo e CRIA os valores sozinho ----
+      - name: Login Azure por codigo e criar AZ_CLIENT_ID / AZ_TENANT_ID
+        if: env.AZ_CID == '' || env.AZ_TID == ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "ABRA https://microsoft.com/devicelogin e digite o codigo que aparecer abaixo:"
+          az login --use-device-code -o none
+          SUB=$(az account show --query id -o tsv)
+          TEN=$(az account show --query tenantId -o tsv)
+          NAME=gamerpc-gh
+          APP=$(az ad app list --display-name "$NAME" --query "[0].appId" -o tsv)
+          if [ -z "$APP" ]; then
+            APP=$(az ad app create --display-name "$NAME" --query appId -o tsv)
+          fi
+          az ad sp show --id "$APP" -o none 2>/dev/null || az ad sp create --id "$APP" -o none
+          ok=0
+          for i in 1 2 3 4 5 6; do
+            if az role assignment create --assignee "$APP" --role Contributor --scope "/subscriptions/$SUB" -o none 2>/dev/null; then ok=1; break; fi
+            if [ -n "$(az role assignment list --assignee "$APP" --scope "/subscriptions/$SUB" --query '[0].id' -o tsv 2>/dev/null)" ]; then ok=1; break; fi
+            sleep 15
+          done
+          [ "$ok" = 1 ] || { echo "::error::Sua conta precisa ser Owner da assinatura para dar a permissao Contributor."; exit 1; }
+          CRED="gh-$(echo "$BRANCH" | sed 's/[^A-Za-z0-9-]/-/g')"
+          SUBJ="repo:${REPO}:ref:refs/heads/${BRANCH}"
+          if [ -z "$(az ad app federated-credential list --id "$APP" --query "[?name=='$CRED'].name" -o tsv)" ]; then
+            az ad app federated-credential create --id "$APP" -o none --parameters "$(jq -nc --arg n "$CRED" --arg s "$SUBJ" \
+              '{name:$n,issuer:"https://token.actions.githubusercontent.com",subject:$s,audiences:["api://AzureADTokenExchange"]}')"
+          fi
+          SALVO="nao"
+          if [ -n "${GH_TOKEN:-}" ]; then
+            gh secret set AZ_CLIENT_ID --body "$APP" --repo "$REPO"
+            gh secret set AZ_TENANT_ID --body "$TEN" --repo "$REPO"
+            gh secret set AZ_SUBSCRIPTION_ID --body "$SUB" --repo "$REPO"
+            SALVO="sim"
+          fi
+          {
+            echo "## Valores criados do Azure"
+            echo "| Segredo | Valor |"; echo "|---|---|"
+            echo "| AZ_CLIENT_ID | \`$APP\` |"
+            echo "| AZ_TENANT_ID | \`$TEN\` |"
+            echo "| AZ_SUBSCRIPTION_ID | \`$SUB\` |"
+            echo ""
+            if [ "$SALVO" = sim ]; then
+              echo "Salvos como secrets do repositorio. Nas proximas execucoes nao pede mais codigo."
+            else
+              echo "Crie estes 3 como **Secrets** do repositorio para nao pedir codigo nas proximas execucoes."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- CRIAR O PC ----
       - name: Criar o PC (VM real no Azure)
         id: criar
         if: inputs.acao == 'criar'
@@ -44,17 +104,98 @@ jobs:
             exit 1
           fi
           echo "::add-mask::$AUTHKEY"
+          # Script que roda dentro do Windows (sem nenhum segredo dentro)
+          cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
+          param(
+            [Parameter(Mandatory = $true)][string]$AuthKey,
+            [Parameter(Mandatory = $true)][string]$Senha,
+            [string]$NomePC = 'gamerpc',
+            [string]$Usuario = 'Rafael'
+          )
+
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
+          $LogFile = 'C:\setup-logs\primeiro-boot.log'
+          function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
+          Log "Inicio do primeiro boot (a chave do Tailscale nunca e gravada neste log)"
+
+          # 1) Conta Windows
+          $sec = ConvertTo-SecureString $Senha -AsPlainText -Force
+          if (Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires $true
+          } else {
+            New-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member $Usuario -ErrorAction SilentlyContinue
+          Log "Conta $Usuario pronta"
+
+          # 2) Login automatico (o Sunshine precisa de uma sessao aberta para transmitir)
+          $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '1'
+          Set-ItemProperty -Path $wl -Name DefaultUserName -Value $Usuario
+          Set-ItemProperty -Path $wl -Name DefaultPassword -Value $Senha
+          Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
+
+          # 3) Energia: sem suspensao e sem desligar tela/disco
+          powercfg /setactive SCHEME_MIN | Out-Null
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          powercfg /hibernate off
+
+          # 4) Tailscale: instala e autentica com a chave do GitHub Secret
+          $msi = 'C:\setup-logs\tailscale.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -UseBasicParsing
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+          if ($p.ExitCode -notin 0, 3010) { throw "Falha ao instalar o Tailscale (codigo $($p.ExitCode))" }
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          for ($i = 0; $i -lt 30 -and -not (Test-Path $ts); $i++) { Start-Sleep 2 }
+          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+          Start-Sleep 5
+
+          & $ts up "--auth-key=$AuthKey" "--hostname=$NomePC" --unattended --reset *> $null
+          if ($LASTEXITCODE -ne 0) { throw "tailscale up falhou (codigo $LASTEXITCODE). Verifique se TAILSCALE_AUTH_KEY e valida e nao expirou." }
+          $AuthKey = $null
+
+          $ip = $null
+          for ($i = 0; $i -lt 60 -and -not $ip; $i++) {
+            try {
+              $st = (& $ts status --json | ConvertFrom-Json)
+              if ($st.BackendState -eq 'Running') { $ip = (& $ts ip -4 | Select-Object -First 1) }
+            } catch {}
+            if (-not $ip) { Start-Sleep 5 }
+          }
+          if (-not $ip) { throw 'O Tailscale nao conectou a tempo.' }
+          Log "Tailscale conectado: $ip"
+
+          # 5) Sunshine (servidor de streaming para o Moonlight)
+          $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest' -Headers @{ 'User-Agent' = 'gamerpc' }
+          $asset = $rel.assets | Where-Object { $_.name -match 'windows' -and $_.name -match 'installer\.exe$' -and $_.name -notmatch 'arm' } | Select-Object -First 1
+          if (-not $asset) { throw 'Instalador do Sunshine nao encontrado.' }
+          $exe = 'C:\setup-logs\sunshine-installer.exe'
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe -UseBasicParsing
+          $p = Start-Process $exe -ArgumentList '/S' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Log "Aviso: instalador do Sunshine retornou $($p.ExitCode)" }
+
+          New-NetFirewallRule -DisplayName 'Sunshine TCP' -Direction Inbound -Protocol TCP -LocalPort 47984, 47989, 47990, 48010 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName 'Sunshine UDP' -Direction Inbound -Protocol UDP -LocalPort 47998, 47999, 48000, 48002, 48010 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+          Log "Sunshine instalado"
+
+          Log "Primeiro boot concluido"
+          PSEOF
           # Senha NAO e mascarada de proposito: ela aparece no resumo final
           PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
           echo "pw=$PW" >> "$GITHUB_OUTPUT"
           az group create -n "$RG" -l "$LOC" -o none
-          # O script vai em custom-data SEM nenhum segredo dentro
           az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
             --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
             --admin-username "$USUARIO" --admin-password "$PW" \
             --os-disk-size-gb 240 --storage-sku Premium_LRS --license-type Windows_Client \
             --public-ip-sku Standard --nsg-rule NONE \
-            --custom-data scripts/primeiro-boot.ps1 -o none
+            --custom-data /tmp/primeiro-boot.ps1 -o none
           if [[ "$TAM" == *NV* ]]; then
             az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
               --name NvidiaGpuDriverWindows --version 1.6 -o none
@@ -66,6 +207,8 @@ jobs:
           az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.Compute \
             --name CustomScriptExtension --version 1.10 \
             --protected-settings "$PS" -o none
+
+      # ---- LIGAR / DESLIGAR / REINICIAR / DESTRUIR ----
       - name: Ligar, desligar, reiniciar ou destruir
         if: contains('ligar desligar reiniciar destruir', inputs.acao)
         env:
@@ -77,6 +220,8 @@ jobs:
             reiniciar) az vm restart -g "$RG" -n "$VM" -o none ;;
             destruir) az group delete -n "$RG" --yes --no-wait ;;
           esac
+
+      # ---- RESUMO: IP TAILSCALE + CONTA WINDOWS ----
       - name: CONECTAR ANDROID (aguarda o Tailscale e mostra os dados)
         if: inputs.acao == 'criar' || inputs.acao == 'status' || inputs.acao == 'ligar' || inputs.acao == 'reiniciar'
         env:
