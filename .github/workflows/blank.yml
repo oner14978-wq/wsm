@@ -8,10 +8,10 @@ on:
         options: [criar, status, ligar, desligar, reiniciar, destruir]
         default: criar
       tamanho:
-        description: Tamanho da VM (so vale em criar)
+        description: Tamanho (auto = GPU se houver cota, senao 16 GB sem GPU)
         type: choice
-        options: [Standard_NV6ads_A10_v5, Standard_D4s_v5]
-        default: Standard_NV6ads_A10_v5
+        options: [auto, Standard_NV6ads_A10_v5, Standard_D4s_v5]
+        default: auto
 permissions:
   contents: read
   id-token: write
@@ -22,37 +22,44 @@ env:
   LOC: ${{ vars.AZ_LOCATION || 'eastus' }}
   REPO: ${{ github.repository }}
   BRANCH: ${{ github.ref_name }}
+  ACAO: ${{ inputs.acao }}
+  TAM_IN: ${{ inputs.tamanho }}
   AZ_CID: ${{ secrets.AZ_CLIENT_ID || vars.AZ_CLIENT_ID }}
   AZ_TID: ${{ secrets.AZ_TENANT_ID || vars.AZ_TENANT_ID }}
   AZ_SID: ${{ secrets.AZ_SUBSCRIPTION_ID || vars.AZ_SUBSCRIPTION_ID }}
 jobs:
   pc:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
-      # ---- LOGIN NO AZURE: usa AZ_* se existirem ----
-      - name: Login Azure (AZ_CLIENT_ID, AZ_TENANT_ID, AZ_SUBSCRIPTION_ID)
+      # ---- 1) LOGIN NO AZURE: usa AZ_* se existirem ----
+      - name: Login Azure (AZ_CLIENT_ID, AZ_TENANT_ID)
         if: env.AZ_CID != '' && env.AZ_TID != ''
         uses: azure/login@v2
         with:
           client-id: ${{ env.AZ_CID }}
           tenant-id: ${{ env.AZ_TID }}
           subscription-id: ${{ env.AZ_SID }}
+          allow-no-subscriptions: true
 
-      # ---- SEM AZ_*: faz login por codigo e CRIA os valores sozinho ----
+      # ---- 1b) SEM AZ_*: login por codigo (so na primeira vez) e cria AZ_* sozinho ----
       - name: Login Azure por codigo e criar AZ_CLIENT_ID / AZ_TENANT_ID
         if: env.AZ_CID == '' || env.AZ_TID == ''
         env:
           GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
         run: |
           set -euo pipefail
-          # Ate 3 tentativas: cada codigo vale ~15 minutos. Abra o link que aparecer e digite o codigo.
           logado=0
           for t in 1 2 3; do
             echo "::notice title=Login Azure::Tentativa $t de 3 - abra o link e digite o codigo mostrado neste passo"
             echo ">>> TENTATIVA $t de 3: abra o link abaixo e digite o codigo que aparecer <<<"
-            if az login --use-device-code -o none; then logado=1; break; fi
-            echo "Codigo expirou sem login. Gerando outro..."
+            az login --use-device-code -o none 2>&1 | tee /tmp/azlogin.log && rc=0 || rc=1
+            if [ "$rc" = 0 ]; then logado=1; break; fi
+            if grep -q "No subscriptions found" /tmp/azlogin.log; then
+              echo "::error::Essa conta do Azure NAO tem assinatura. Crie uma em azure.com/free (ou entre com outra conta) e rode de novo."
+              exit 1
+            fi
+            echo "Login nao concluido (codigo expirou ou foi recusado). Gerando outro..."
           done
           [ "$logado" = 1 ] || { echo "::error::Login no Azure nao concluido. Rode a acao de novo e entre no link logo que o codigo aparecer."; exit 1; }
           SUB=$(az account show --query id -o tsv)
@@ -97,20 +104,126 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- CRIAR O PC ----
+      # ---- 2) VERIFICAR ASSINATURA ----
+      - name: Verificar assinatura do Azure
+        run: |
+          set -uo pipefail
+          falha() { echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          TOTAL=$(az account list --all --query "length(@)" -o tsv 2>/dev/null || echo 0)
+          ATIVAS=$(az account list --all --query "[?state=='Enabled'] | length(@)" -o tsv 2>/dev/null || echo 0)
+          if [ "${TOTAL:-0}" = 0 ]; then
+            falha "FALTA ASSINATURA: essa conta do Azure nao tem nenhuma assinatura. O Azure exige cadastro (com cartao para verificacao) em azure.com/free. O workflow nao consegue criar isso por voce."
+          fi
+          if [ "${ATIVAS:-0}" = 0 ]; then
+            ESTADOS=$(az account list --all --query "[].state" -o tsv | sort -u | tr '\n' ' ')
+            falha "ASSINATURA SEM USO: existe, mas nao esta ativa (estado: $ESTADOS). Isso costuma indicar credito acabado, teste gratuito expirado ou pagamento pendente. Resolva em portal.azure.com > Assinaturas."
+          fi
+          SUB="${AZ_SID:-}"
+          if [ -z "$SUB" ]; then
+            SUB=$(az account list --all --query "[?state=='Enabled'] | [0].id" -o tsv)
+          fi
+          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura $SUB nao esta acessivel por esta conta/app. Detalhe: $(head -c 300 /tmp/err)"
+          NOME=$(az account show --query name -o tsv)
+          echo "Assinatura em uso: $NOME"
+          echo "ASSINATURA=$NOME" >> "$GITHUB_ENV"
+
+      # ---- 3) PREPARAR: provedores, regiao, GPU e cota ----
+      - name: Preparar recursos e verificar GPU / cota
+        id: prep
+        if: inputs.acao == 'criar'
+        env:
+          AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -uo pipefail
+          falha() { echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+
+          if [ -z "$AUTHKEY" ]; then
+            falha "FALTA O SECRET TAILSCALE_AUTH_KEY. Crie em Settings > Secrets and variables > Actions e rode de novo."
+          fi
+
+          for P in Microsoft.Compute Microsoft.Network Microsoft.Storage; do
+            az provider register --namespace "$P" --wait -o none 2>/tmp/err \
+              || falha "SEM PERMISSAO para ativar o provedor $P. A conta/app precisa ser Contributor ou Owner da assinatura. Detalhe: $(head -c 300 /tmp/err)"
+          done
+
+          if az vm show -g "$RG" -n "$VM" -o none 2>/dev/null; then
+            falha "O PC $VM ja existe. Rode a acao destruir antes de criar de novo."
+          fi
+
+          OUTRAS="eastus eastus2 westus2 westus3 southcentralus centralus westeurope northeurope"
+          MOTIVOS=""
+
+          livre() {
+            echo "$1" | jq -r --arg f "$2" '[.[] | select((.name.value | ascii_downcase) == ($f | ascii_downcase)) | ((.limit | tonumber) - (.currentValue | tonumber))] | .[0] // 0' 2>/dev/null || echo 0
+          }
+
+          # checa REGIAO TAMANHO FAMILIA VCPUS
+          checa() {
+            local R="$1" S="$2" F="$3" V="$4" N RS U FAM TOT
+            N=$(az vm list-skus -l "$R" --size "$S" --resource-type virtualMachines --query "length(@)" -o tsv 2>/dev/null || echo 0)
+            if [ "${N:-0}" -le 0 ]; then MOTIVOS+=$'\n'"- $S nao e oferecido em $R"; return 1; fi
+            RS=$(az vm list-skus -l "$R" --size "$S" --resource-type virtualMachines --query "[0].restrictions | length(@)" -o tsv 2>/dev/null || echo 0)
+            if [ "${RS:-0}" != 0 ]; then MOTIVOS+=$'\n'"- $S esta bloqueado para esta assinatura em $R"; return 1; fi
+            U=$(az vm list-usage -l "$R" -o json 2>/dev/null || echo '[]')
+            FAM=$(livre "$U" "$F"); TOT=$(livre "$U" cores)
+            if [ "${FAM:-0}" -lt "$V" ]; then MOTIVOS+=$'\n'"- $S em $R: cota da familia $F = ${FAM:-0} vCPU livres (precisa de $V)"; return 1; fi
+            if [ "${TOT:-0}" -lt "$V" ]; then MOTIVOS+=$'\n'"- $S em $R: cota total de vCPU = ${TOT:-0} livres (precisa de $V)"; return 1; fi
+            return 0
+          }
+
+          ESC=""; REG=""; AVISO=""
+          if [ "$TAM_IN" != "Standard_D4s_v5" ]; then
+            for R in $LOC $OUTRAS; do
+              if checa "$R" Standard_NV6ads_A10_v5 standardNVadsA10v5Family 6; then ESC=Standard_NV6ads_A10_v5; REG="$R"; break; fi
+            done
+            if [ -z "$ESC" ] && [ "$TAM_IN" = "Standard_NV6ads_A10_v5" ]; then
+              falha "SEM COTA/DISPONIBILIDADE DE GPU NVIDIA (A10) em nenhuma regiao testada.$MOTIVOS"$'\n\n'"Para liberar: portal.azure.com > Assinaturas > Uso + cotas, filtre por NVadsA10v5 e peca 6 vCPU. Contas de teste gratuito costumam nao permitir GPU e podem exigir plano pago. O workflow nao pode aprovar cota por voce."
+            fi
+          fi
+          if [ -z "$ESC" ]; then
+            GPUMOT="$MOTIVOS"; MOTIVOS=""
+            for R in $LOC $OUTRAS; do
+              if checa "$R" Standard_D4s_v5 standardDSv5Family 4; then ESC=Standard_D4s_v5; REG="$R"; break; fi
+            done
+            if [ -z "$ESC" ]; then
+              falha "SEM COTA DE vCPU para criar o PC.$GPUMOT$MOTIVOS"$'\n\n'"Peca aumento em portal.azure.com > Assinaturas > Uso + cotas. O workflow nao pode aprovar cota por voce."
+            fi
+            if [ "$TAM_IN" != "Standard_D4s_v5" ]; then
+              AVISO="Sem GPU: a conta nao tem cota/disponibilidade da NVIDIA A10.$GPUMOT"
+            fi
+          fi
+
+          if [ "$ESC" = Standard_NV6ads_A10_v5 ]; then RAM="55 GB (menor tamanho com GPU A10; nao existe A10 com 16 GB)"; GPU="NVIDIA A10 (fracao de 1/6)"; else RAM="16 GB"; GPU="sem GPU"; fi
+          echo "Escolhido: $ESC em $REG"
+          echo "regiao=$REG" >> "$GITHUB_OUTPUT"
+          echo "tamanho=$ESC" >> "$GITHUB_OUTPUT"
+          echo "ram=$RAM" >> "$GITHUB_OUTPUT"
+          echo "gpu=$GPU" >> "$GITHUB_OUTPUT"
+          echo "aviso=$(echo "$AVISO" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      # ---- 4) CRIAR O PC ----
       - name: Criar o PC (VM real no Azure)
         id: criar
         if: inputs.acao == 'criar'
         env:
           AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          TAM: ${{ inputs.tamanho }}
+          TAM: ${{ steps.prep.outputs.tamanho }}
+          REG: ${{ steps.prep.outputs.regiao }}
         run: |
-          set -euo pipefail
-          if [ -z "$AUTHKEY" ]; then
-            echo "::error::O segredo TAILSCALE_AUTH_KEY nao existe ou esta vazio."
-            exit 1
-          fi
+          set -uo pipefail
+          falha() { echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          traduz() {
+            case "$1" in
+              *AuthorizationFailed*|*"does not have authorization"*) echo "SEM PERMISSAO: a conta/app precisa ser Contributor ou Owner da assinatura." ;;
+              *SpendingLimitReached*|*ReadOnlyDisabledSubscription*|*SubscriptionDisabled*|*"subscription is disabled"*|*PaymentRequired*) echo "SEM CREDITO: assinatura desativada ou com limite de gasto atingido. Veja portal.azure.com > Assinaturas > Cost Management." ;;
+              *QuotaExceeded*|*"quota"*|*OperationNotAllowed*) echo "SEM COTA de vCPU na regiao $REG. Peca aumento em portal.azure.com > Assinaturas > Uso + cotas." ;;
+              *SkuNotAvailable*|*AllocationFailed*|*ZonalAllocationFailed*) echo "O Azure esta sem capacidade desse tamanho agora em $REG. Tente de novo mais tarde." ;;
+              *RequestDisallowedByPolicy*) echo "Uma politica da organizacao bloqueou a criacao." ;;
+              *) echo "Erro do Azure: $(echo "$1" | tail -c 400)" ;;
+            esac
+          }
           echo "::add-mask::$AUTHKEY"
+
           # Script que roda dentro do Windows (sem nenhum segredo dentro)
           cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
           param(
@@ -191,89 +304,50 @@ jobs:
           New-NetFirewallRule -DisplayName 'Sunshine UDP' -Direction Inbound -Protocol UDP -LocalPort 47998, 47999, 48000, 48002, 48010 -Action Allow -ErrorAction SilentlyContinue | Out-Null
           Log "Sunshine instalado"
 
+          # Login do Sunshine = mesma conta do Windows (evita criar usuario no painel)
+          $sun = 'C:\Program Files\Sunshine\sunshine.exe'
+          if (Test-Path $sun) {
+            try {
+              Push-Location 'C:\Program Files\Sunshine'
+              & $sun --creds $Usuario $Senha *> $null
+              Pop-Location
+              Restart-Service -Name SunshineService -ErrorAction SilentlyContinue
+              Log "Login do Sunshine definido"
+            } catch { Log "Aviso: nao foi possivel definir o login do Sunshine" }
+          }
+
           Log "Primeiro boot concluido"
           PSEOF
+
           # Senha NAO e mascarada de proposito: ela aparece no resumo final
           PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
           echo "pw=$PW" >> "$GITHUB_OUTPUT"
-          az group create -n "$RG" -l "$LOC" -o none
+
+          if [ "$(az group exists -n "$RG")" = true ]; then az group delete -n "$RG" --yes -o none 2>/dev/null; fi
+          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
+
           az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
             --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
             --admin-username "$USUARIO" --admin-password "$PW" \
             --os-disk-size-gb 240 --storage-sku Premium_LRS --license-type Windows_Client \
             --public-ip-sku Standard --nsg-rule NONE \
-            --custom-data /tmp/primeiro-boot.ps1 -o none
+            --custom-data /tmp/primeiro-boot.ps1 -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
+
           if [[ "$TAM" == *NV* ]]; then
             az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
-              --name NvidiaGpuDriverWindows --version 1.6 -o none
+              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
+              || echo "::warning::Driver NVIDIA nao instalou: $(tail -c 300 /tmp/err)"
           fi
+
           # A chave e a senha vao em protected-settings (criptografado, nao aparece em logs nem no portal)
           CMD="powershell -ExecutionPolicy Bypass -Command \"Copy-Item C:\\AzureData\\CustomData.bin C:\\setup.ps1 -Force; & C:\\setup.ps1 -AuthKey '$AUTHKEY' -NomePC '$VM' -Usuario '$USUARIO' -Senha '$PW'\""
           PS=$(jq -nc --arg c "$CMD" '{commandToExecute:$c}')
           echo "::add-mask::$PS"
           az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.Compute \
             --name CustomScriptExtension --version 1.10 \
-            --protected-settings "$PS" -o none
+            --protected-settings "$PS" -o none 2>/tmp/err \
+            || falha "O script de primeiro boot falhou dentro do Windows. A causa mais comum e TAILSCALE_AUTH_KEY invalida ou expirada (gere outra no painel do Tailscale). Logs na VM: C:\\setup-logs\\primeiro-boot.log"
 
-      # ---- LIGAR / DESLIGAR / REINICIAR / DESTRUIR ----
+      # ---- 5) LIGAR / DESLIGAR / REINICIAR / DESTRUIR ----
       - name: Ligar, desligar, reiniciar ou destruir
-        if: contains('ligar desligar reiniciar destruir', inputs.acao)
-        env:
-          ACAO: ${{ inputs.acao }}
-        run: |
-          case "$ACAO" in
-            ligar) az vm start -g "$RG" -n "$VM" -o none ;;
-            desligar) az vm deallocate -g "$RG" -n "$VM" -o none ;;
-            reiniciar) az vm restart -g "$RG" -n "$VM" -o none ;;
-            destruir) az group delete -n "$RG" --yes --no-wait ;;
-          esac
-
-      # ---- RESUMO: IP TAILSCALE + CONTA WINDOWS ----
-      - name: CONECTAR ANDROID (aguarda o Tailscale e mostra os dados)
-        if: inputs.acao == 'criar' || inputs.acao == 'status' || inputs.acao == 'ligar' || inputs.acao == 'reiniciar'
-        env:
-          ACAO: ${{ inputs.acao }}
-          SENHA: ${{ steps.criar.outputs.pw }}
-        run: |
-          IP=""
-          STATE="nao criada"
-          TENTATIVAS=40
-          [ "$ACAO" = status ] && TENTATIVAS=1
-          for i in $(seq 1 "$TENTATIVAS"); do
-            STATE=$(az vm get-instance-view -g "$RG" -n "$VM" --query "instanceView.statuses[?starts_with(code,'PowerState')].displayStatus" -o tsv 2>/dev/null || echo "nao criada")
-            if [ "$STATE" = "VM running" ]; then
-              OUT=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
-                --scripts '$j = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json; if ($j.BackendState -eq "Running") { & "C:\Program Files\Tailscale\tailscale.exe" ip -4 }' \
-                -o json 2>/dev/null || true)
-              IP=$(echo "$OUT" | jq -r '.value[0].message // ""' 2>/dev/null | grep -oE '100\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-              [ -n "$IP" ] && break
-            fi
-            [ "$i" -lt "$TENTATIVAS" ] && sleep 20
-          done
-          if [ -n "$IP" ]; then ON="Conectado"; else ON="Desconectado"; IP="ainda sem IP"; fi
-          {
-            echo "## CONECTAR ANDROID"
-            echo "| Item | Valor |"; echo "|---|---|"
-            echo "| Estado da VM | $STATE |"
-            echo "| Tailscale | $ON |"
-            echo "| IP privado Tailscale | \`$IP\` |"
-            echo "| Nome do PC | \`$VM\` |"
-            echo "| Sunshine | https://$IP:47990 |"
-            echo ""
-            echo "1. No Android, instale o **Tailscale** e entre na mesma conta."
-            echo "2. Instale o **Moonlight** e adicione o PC pelo IP acima."
-            echo "3. No navegador, abra o endereço do Sunshine, crie o usuário e digite o PIN do Moonlight."
-            echo ""
-            echo "## CONTA WINDOWS"
-            echo "| Item | Valor |"; echo "|---|---|"
-            echo "| Conta | \`$USUARIO\` |"
-            if [ -n "$SENHA" ]; then
-              echo "| Senha | \`$SENHA\` |"
-            else
-              echo "| Senha | definida na criação do PC (veja a execução da ação criar) |"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
-          echo "Tailscale: $ON | IP: $IP"
-          echo "Conta: $USUARIO"
-          [ -n "$SENHA" ] && echo "Senha: $SENHA" || true
-          
+        if: contains('ligar desligar 
