@@ -42,7 +42,7 @@ jobs:
           subscription-id: ${{ env.AZ_SID }}
           allow-no-subscriptions: true
 
-      # ---- 1b) SEM AZ_*: login por codigo (so na primeira vez); espera a assinatura; cria AZ_* sozinho ----
+      # ---- 1b) SEM AZ_*: login por codigo (so na primeira vez) ----
       - name: Login Azure por codigo, aguardar assinatura e criar AZ_CLIENT_ID / AZ_TENANT_ID
         if: env.AZ_CID == '' || env.AZ_TID == ''
         env:
@@ -54,13 +54,29 @@ jobs:
 
           logado=0
           for t in 1 2 3; do
-            echo "::notice title=Login Azure::Tentativa $t de 3 - abra o link e digite o codigo mostrado neste passo"
-            echo ">>> TENTATIVA $t de 3: abra o link abaixo e digite o codigo que aparecer <<<"
-            az login --use-device-code --allow-no-subscriptions -o none 2>&1 | tee /tmp/azlogin.log && rc=0 || rc=1
-            if [ "$rc" = 0 ]; then logado=1; break; fi
-            echo "Login nao concluido (codigo expirou ou foi recusado). Gerando outro..."
+            rm -f /tmp/azlogin.log
+            az login --use-device-code --allow-no-subscriptions -o none > /tmp/azlogin.log 2>&1 &
+            PID=$!
+
+            CODIGO=""
+            for i in $(seq 1 30); do
+              CODIGO=$(grep -oE 'enter the code [A-Z0-9]+' /tmp/azlogin.log | awk '{print $4}' | head -1)
+              [ -n "$CODIGO" ] && break
+              sleep 2
+            done
+            [ -n "$CODIGO" ] || { echo "Nao apareceu codigo:"; cat /tmp/azlogin.log; kill $PID 2>/dev/null; continue; }
+
+            for i in $(seq 1 36); do
+              kill -0 $PID 2>/dev/null || break
+              echo ">>> TENTATIVA $t de 3 | CODIGO: $CODIGO | LINK: https://login.microsoft.com/device | restam ~$(( (36 - i) * 20 / 60 )) min <<<"
+              sleep 20
+            done
+
+            if wait $PID; then logado=1; break; fi
+            echo "Login nao concluido nesta tentativa:"; tail -n 5 /tmp/azlogin.log
+            kill $PID 2>/dev/null
           done
-          [ "$logado" = 1 ] || falha "LOGIN NAO CONCLUIDO. Rode a acao de novo e entre no link logo que o codigo aparecer."
+          [ "$logado" = 1 ] || falha "LOGIN NAO CONCLUIDO. Rode de novo, abra https://login.microsoft.com/device assim que o codigo aparecer e, na ultima tela, toque em Continuar (nao em Cancelar)."
 
           CONTA=$(az account show --query user.name -o tsv 2>/dev/null)
           conta_total() { az account list --all --refresh --query "[?$FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0; }
@@ -70,21 +86,18 @@ jobs:
             {
               echo "## FALTA ASSINATURA DO AZURE"
               echo ""
-              echo "A conta **$CONTA** entrou no Azure, mas ainda nao tem assinatura. O workflow NAO cria assinatura por voce: o cadastro e feito por voce, com a Microsoft."
-              echo ""
+              echo "A conta **$CONTA** entrou no Azure, mas ainda nao tem assinatura."
               echo "1. Abra https://azure.microsoft.com/free e toque em **Comece gratuitamente**."
               echo "2. Entre com o MESMO e-mail: **$CONTA**."
-              echo "3. Preencha os dados, confirme o telefone e o cartao (a Microsoft usa o cartao so para verificar a identidade)."
-              echo "4. Quando terminar, volte aqui. Este workflow fica verificando a cada 30 segundos, por ate 30 minutos, e continua sozinho quando a assinatura aparecer."
+              echo "3. Termine o cadastro. Este workflow verifica a cada 30 segundos, por ate 30 minutos."
             } >> "$GITHUB_STEP_SUMMARY"
-            echo "::notice title=Falta assinatura::Crie a assinatura em https://azure.microsoft.com/free com o e-mail $CONTA. O workflow aguarda ate 30 minutos."
             echo "FALTA ASSINATURA. Crie em https://azure.microsoft.com/free com o e-mail $CONTA. Aguardando..."
             for i in $(seq 1 60); do
               sleep 30
               [ "$(conta_total)" != 0 ] && break
               echo "Aguardando a assinatura... ($i de 60)"
             done
-            [ "$(conta_total)" != 0 ] || falha "ASSINATURA NAO APARECEU em 30 minutos. Termine o cadastro em https://azure.microsoft.com/free com o e-mail $CONTA e rode a acao de novo."
+            [ "$(conta_total)" != 0 ] || falha "ASSINATURA NAO APARECEU em 30 minutos. Termine o cadastro em https://azure.microsoft.com/free com o e-mail $CONTA e rode de novo."
           fi
 
           if [ "$(conta_ativas)" = 0 ]; then
@@ -94,7 +107,7 @@ jobs:
               echo "Assinatura ainda sendo ativada... ($i de 20)"
             done
           fi
-          [ "$(conta_ativas)" != 0 ] || falha "ASSINATURA NAO ESTA ATIVA (estado: $(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')). Credito acabado, pagamento pendente ou ativacao em andamento. Veja portal.azure.com > Assinaturas."
+          [ "$(conta_ativas)" != 0 ] || falha "ASSINATURA NAO ESTA ATIVA (estado: $(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')). Veja portal.azure.com > Assinaturas."
 
           SUB=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | [0].id" -o tsv)
           az account set --subscription "$SUB"
@@ -152,34 +165,31 @@ jobs:
 
           if [ "${TOTAL:-0}" = 0 ]; then
             if [ -n "${AZ_CID:-}" ]; then
-              falha "O app do Azure (AZ_CLIENT_ID) nao enxerga nenhuma assinatura. Se a assinatura ainda nao existe, crie em https://azure.microsoft.com/free. Se ja existe, o dono precisa dar o papel Contributor ao app gamerpc-gh, ou voce apaga os Secrets AZ_* para o workflow refazer a configuracao pelo login por codigo."
+              falha "O app do Azure (AZ_CLIENT_ID) nao enxerga nenhuma assinatura. Crie em https://azure.microsoft.com/free, ou apague os Secrets AZ_* para refazer pelo login por codigo."
             fi
-            falha "FALTA ASSINATURA: a conta $CONTA nao tem assinatura. Crie em https://azure.microsoft.com/free com esse e-mail e rode de novo."
+            falha "FALTA ASSINATURA: a conta $CONTA nao tem assinatura. Crie em https://azure.microsoft.com/free e rode de novo."
           fi
           if [ "${ATIVAS:-0}" = 0 ]; then
             ESTADOS=$(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')
-            falha "ASSINATURA NAO ESTA ATIVA (estado: $ESTADOS). Isso costuma ser credito acabado, teste gratuito expirado ou pagamento pendente. O dono da conta precisa resolver em portal.azure.com > Assinaturas."
+            falha "ASSINATURA NAO ESTA ATIVA (estado: $ESTADOS). Resolva em portal.azure.com > Assinaturas."
           fi
 
           SUB="${AZ_SID:-}"
           if [ -z "$SUB" ]; then
             SUB=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | [0].id" -o tsv)
           fi
-          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura informada nao esta acessivel por esta conta/app. Detalhe: $(head -c 300 /tmp/err)"
+          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura informada nao esta acessivel. Detalhe: $(head -c 300 /tmp/err)"
           NOME=$(az account show --query name -o tsv)
 
-          # Oferta (tipo de assinatura) e limite de gasto
           INFO=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB?api-version=2020-01-01" -o json 2>/dev/null || echo '{}')
           QUOTA=$(echo "$INFO" | jq -r '.subscriptionPolicies.quotaId // "desconhecida"')
           LIMITE=$(echo "$INFO" | jq -r '.subscriptionPolicies.spendingLimit // "desconhecido"')
-          CREDITO="o Azure nao informa o saldo por API: confira em portal.azure.com > Assinaturas > Cost Management"
           NOTA=""
           case "$QUOTA" in
-            FreeTrial*) NOTA="Teste gratuito: o credito e limitado e a GPU NVIDIA normalmente fica bloqueada. Para usar GPU, o dono precisa fazer Upgrade para pagamento conforme o uso no portal." ;;
+            FreeTrial*) NOTA="Teste gratuito: o credito e limitado e a GPU NVIDIA normalmente fica bloqueada. Para usar GPU, faca Upgrade para pagamento conforme o uso no portal." ;;
           esac
           if [ "$LIMITE" = "On" ]; then NOTA="$NOTA Limite de gasto ativado: alguns tamanhos de VM podem ser bloqueados."; fi
 
-          # Permissao para criar maquinas virtuais
           PERM=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" --query "value[].actions[]" -o tsv 2>/dev/null || true)
           if [ -z "$PERM" ]; then
             PODE="nao foi possivel verificar (sera testado ao criar)"
@@ -189,7 +199,7 @@ jobs:
             PODE="nao"
           fi
           if [ "$PODE" = "nao" ]; then
-            falha "SEM PERMISSAO PARA CRIAR MAQUINAS VIRTUAIS em $NOME. O dono da assinatura precisa dar o papel Contributor (ou Owner) para $CONTA em portal.azure.com > Assinaturas > Controle de acesso (IAM)."
+            falha "SEM PERMISSAO PARA CRIAR MAQUINAS VIRTUAIS em $NOME. De o papel Contributor (ou Owner) para $CONTA em portal.azure.com > Assinaturas > Controle de acesso (IAM)."
           fi
 
           echo "Assinatura em uso: $NOME"
@@ -205,7 +215,6 @@ jobs:
             echo "| Tipo de oferta | $QUOTA |"
             echo "| Limite de gasto | $LIMITE |"
             echo "| Pode criar VMs | $PODE |"
-            echo "| Creditos | $CREDITO |"
             if [ -n "$NOTA" ]; then echo ""; echo "**Atencao:** $NOTA"; fi
             echo ""
           } >> "$GITHUB_STEP_SUMMARY"
@@ -226,7 +235,7 @@ jobs:
 
           for P in Microsoft.Compute Microsoft.Network Microsoft.Storage; do
             az provider register --namespace "$P" --wait -o none 2>/tmp/err \
-              || falha "SEM PERMISSAO para ativar o provedor $P. A conta/app precisa ser Contributor ou Owner da assinatura. Detalhe: $(head -c 300 /tmp/err)"
+              || falha "SEM PERMISSAO para ativar o provedor $P. Detalhe: $(head -c 300 /tmp/err)"
           done
 
           if az vm show -g "$RG" -n "$VM" -o none 2>/dev/null; then
@@ -240,7 +249,6 @@ jobs:
             echo "$1" | jq -r --arg f "$2" '[.[] | select((.name.value | ascii_downcase) == ($f | ascii_downcase)) | ((.limit | tonumber) - (.currentValue | tonumber))] | .[0] // 0' 2>/dev/null || echo 0
           }
 
-          # checa REGIAO TAMANHO FAMILIA VCPUS
           checa() {
             local R="$1" S="$2" F="$3" V="$4" N RS U FAM TOT
             N=$(az vm list-skus -l "$R" --size "$S" --resource-type virtualMachines --query "length(@)" -o tsv 2>/dev/null || echo 0)
@@ -260,7 +268,7 @@ jobs:
               if checa "$R" Standard_NV6ads_A10_v5 standardNVadsA10v5Family 6; then ESC=Standard_NV6ads_A10_v5; REG="$R"; break; fi
             done
             if [ -z "$ESC" ] && [ "$TAM_IN" = "Standard_NV6ads_A10_v5" ]; then
-              falha "SEM COTA/DISPONIBILIDADE DE GPU NVIDIA (A10) em nenhuma regiao testada.$MOTIVOS"$'\n\n'"Para liberar: portal.azure.com > Assinaturas > Uso + cotas, filtre por NVadsA10v5 e peca 6 vCPU. Contas de teste gratuito costumam nao permitir GPU e podem exigir plano pago. O workflow nao pode aprovar cota por voce."
+              falha "SEM COTA/DISPONIBILIDADE DE GPU NVIDIA (A10) em nenhuma regiao testada.$MOTIVOS"$'\n\n'"Para liberar: portal.azure.com > Assinaturas > Uso + cotas, filtre por NVadsA10v5 e peca 6 vCPU."
             fi
           fi
           if [ -z "$ESC" ]; then
@@ -269,14 +277,14 @@ jobs:
               if checa "$R" Standard_D4s_v5 standardDSv5Family 4; then ESC=Standard_D4s_v5; REG="$R"; break; fi
             done
             if [ -z "$ESC" ]; then
-              falha "SEM COTA DE vCPU para criar o PC.$GPUMOT$MOTIVOS"$'\n\n'"Peca aumento em portal.azure.com > Assinaturas > Uso + cotas. O workflow nao pode aprovar cota por voce."
+              falha "SEM COTA DE vCPU para criar o PC.$GPUMOT$MOTIVOS"$'\n\n'"Peca aumento em portal.azure.com > Assinaturas > Uso + cotas."
             fi
             if [ "$TAM_IN" != "Standard_D4s_v5" ]; then
               AVISO="Sem GPU: a conta nao tem cota/disponibilidade da NVIDIA A10.$GPUMOT"
             fi
           fi
 
-          if [ "$ESC" = Standard_NV6ads_A10_v5 ]; then RAM="55 GB (menor tamanho com GPU A10; nao existe A10 com 16 GB)"; GPU="NVIDIA A10 (fracao de 1/6)"; else RAM="16 GB"; GPU="sem GPU"; fi
+          if [ "$ESC" = Standard_NV6ads_A10_v5 ]; then RAM="55 GB (menor tamanho com GPU A10)"; GPU="NVIDIA A10 (fracao de 1/6)"; else RAM="16 GB"; GPU="sem GPU"; fi
           echo "Escolhido: $ESC em $REG"
           echo "regiao=$REG" >> "$GITHUB_OUTPUT"
           echo "tamanho=$ESC" >> "$GITHUB_OUTPUT"
@@ -284,7 +292,7 @@ jobs:
           echo "gpu=$GPU" >> "$GITHUB_OUTPUT"
           echo "aviso=$(echo "$AVISO" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
-      # ---- 4) CRIAR O PC ----
+      # ---- 4) CRIAR O PC (RECONSTRUIDO: o anexo original veio cortado aqui) ----
       - name: Criar o PC (VM real no Azure)
         id: criar
         if: inputs.acao == 'criar'
@@ -292,43 +300,76 @@ jobs:
           AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           TAM: ${{ steps.prep.outputs.tamanho }}
           REG: ${{ steps.prep.outputs.regiao }}
+          RAM: ${{ steps.prep.outputs.ram }}
+          GPU: ${{ steps.prep.outputs.gpu }}
+          AVISO: ${{ steps.prep.outputs.aviso }}
         run: |
           set -uo pipefail
           falha() { echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           traduz() {
             case "$1" in
               *AuthorizationFailed*|*"does not have authorization"*) echo "SEM PERMISSAO: a conta/app precisa ser Contributor ou Owner da assinatura." ;;
-              *SpendingLimitReached*|*ReadOnlyDisabledSubscription*|*SubscriptionDisabled*|*"subscription is disabled"*|*PaymentRequired*) echo "SEM CREDITO: assinatura desativada ou com limite de gasto atingido. Veja portal.azure.com > Assinaturas > Cost Management." ;;
-              *QuotaExceeded*|*"quota"*|*OperationNotAllowed*) echo "SEM COTA de vCPU na regiao $REG. Peca aumento em portal.azure.com > Assinaturas > Uso + cotas." ;;
-              *SkuNotAvailable*|*AllocationFailed*|*ZonalAllocationFailed*) echo "O Azure esta sem capacidade desse tamanho agora em $REG. Tente de novo mais tarde." ;;
+              *SpendingLimitReached*|*ReadOnlyDisabledSubscription*|*SubscriptionDisabled*|*PaymentRequired*) echo "SEM CREDITO: assinatura desativada ou com limite de gasto atingido." ;;
+              *QuotaExceeded*|*"quota"*|*OperationNotAllowed*) echo "SEM COTA de vCPU na regiao $REG. Peca aumento em Uso + cotas." ;;
+              *SkuNotAvailable*|*AllocationFailed*|*ZonalAllocationFailed*) echo "O Azure esta sem capacidade desse tamanho agora em $REG. Tente mais tarde." ;;
               *RequestDisallowedByPolicy*) echo "Uma politica da organizacao bloqueou a criacao." ;;
               *) echo "Erro do Azure: $(echo "$1" | tail -c 400)" ;;
             esac
           }
           echo "::add-mask::$AUTHKEY"
 
-          # Script que roda dentro do Windows (embutido em base64, sem nenhum segredo)
-          base64 -d > /tmp/primeiro-boot.ps1 <<'B64EOF'
-          cGFyYW0oCiAgW1BhcmFtZXRlcihNYW5kYXRvcnkgPSAkdHJ1ZSldW3N0cmluZ10kQXV0aEtleSwK
-          ICBbUGFyYW1ldGVyKE1hbmRhdG9yeSA9ICR0cnVlKV1bc3RyaW5nXSRTZW5oYSwKICBbc3RyaW5n
-          XSROb21lUEMgPSAnZ2FtZXJwYycsCiAgW3N0cmluZ10kVXN1YXJpbyA9ICdSYWZhZWwnCikKCiRF
-          cnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKJFByb2dyZXNzUHJlZmVyZW5jZSA9ICdTaWxl
-          bnRseUNvbnRpbnVlJwpbTmV0LlNlcnZpY2VQb2ludE1hbmFnZXJdOjpTZWN1cml0eVByb3RvY29s
-          ID0gW05ldC5TZWN1cml0eVByb3RvY29sVHlwZV06OlRsczEyCgpOZXctSXRlbSAtSXRlbVR5cGUg
-          RGlyZWN0b3J5IC1Gb3JjZSAtUGF0aCBDOlxzZXR1cC1sb2dzIHwgT3V0LU51bGwKJExvZ0ZpbGUg
-          PSAnQzpcc2V0dXAtbG9nc1xwcmltZWlyby1ib290LmxvZycKZnVuY3Rpb24gTG9nKCRtKSB7ICIk
-          KEdldC1EYXRlIC1Gb3JtYXQgcykgJG0iIHwgT3V0LUZpbGUgLUZpbGVQYXRoICRMb2dGaWxlIC1B
-          cHBlbmQgLUVuY29kaW5nIHV0ZjggfQpMb2cgIkluaWNpbyBkbyBwcmltZWlybyBib290IChhIGNo
-          YXZlIGRvIFRhaWxzY2FsZSBudW5jYSBlIGdyYXZhZGEgbmVzdGUgbG9nKSIKCiMgMSkgQ29udGEg
-          V2luZG93cwokc2VjID0gQ29udmVydFRvLVNlY3VyZVN0cmluZyAkU2VuaGEgLUFzUGxhaW5UZXh0
-          IC1Gb3JjZQppZiAoR2V0LUxvY2FsVXNlciAtTmFtZSAkVXN1YXJpbyAtRXJyb3JBY3Rpb24gU2ls
-          ZW50bHlDb250aW51ZSkgewogIFNldC1Mb2NhbFVzZXIgLU5hbWUgJFVzdWFyaW8gLVBhc3N3b3Jk
-          ICRzZWMgLVBhc3N3b3JkTmV2ZXJFeHBpcmVzICR0cnVlCn0gZWxzZSB7CiAgTmV3LUxvY2FsVXNl
-          ciAtTmFtZSAkVXN1YXJpbyAtUGFzc3dvcmQgJHNlYyAtUGFzc3dvcmROZXZlckV4cGlyZXMgLUFj
-          Y291bnROZXZlckV4cGlyZXMgfCBPdXQtTnVsbAp9CkFkZC1Mb2NhbEdyb3VwTWVtYmVyIC1Hcm91
-          cCAnQWRtaW5pc3RyYXRvcnMnIC1NZW1iZXIgJFVzdWFyaW8gLUVycm9yQWN0aW9uIFNpbGVudGx5
-          Q29udGludWUKTG9nICJDb250YSAkVXN1YXJpbyBwcm9udGEiCgojIDIpIExvZ2luIGF1dG9tYXRp
-          Y28gKG8gU3Vuc2hpbmUgcHJlY2lzYSBkZSB1bWEgc2Vzc2FvIGFiZXJ0YSBwYXJhIHRyYW5zbWl0
-          aXIpCiR3bCA9ICdIS0xNOlxTT0ZUV0FSRVxNaWNyb3NvZnRcV2luZG93cyBOVFxDdXJyZW50VmVy
-          c2lvblxXaW5sb2dvbicKU2V0LUl0ZW1Qcm9wZXJ0eSAtUGF0aCAkd2wgLU5hbWUgQXV0b0FkbWlu
-          TG9nb24gLVZhbHVlICcxJwpTZXQtSXRlbVByb3BlcnR5IC1QY
+          SENHA="Aa1-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "::add-mask::$SENHA"
+
+          cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
+          param(
+            [Parameter(Mandatory = $true)][string]$AuthKey,
+            [string]$NomePC = 'gamerpc'
+          )
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
+          $LogFile = 'C:\setup-logs\primeiro-boot.log'
+          function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
+          Log 'Inicio (a chave do Tailscale nunca e gravada neste log)'
+
+          # Area de Trabalho Remota
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Log 'RDP ligado'
+
+          # Tailscale
+          $msi = 'C:\setup-logs\tailscale.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 10
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key=$AuthKey --hostname=$NomePC --unattended 2>&1 | Out-Null
+          Log 'Tailscale conectado'
+          PSEOF
+
+          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
+
+          echo "Criando a VM $TAM em $REG (leva alguns minutos)..."
+          az vm create -g "$RG" -n "$VM" -l "$REG" --size "$TAM" \
+            --image MicrosoftWindowsDesktop:windows-11:win11-23h2-pro:latest \
+            --admin-username "$USUARIO" --admin-password "$SENHA" \
+            --license-type Windows_Client --os-disk-size-gb 256 \
+            --public-ip-sku Standard --nsg-rule NONE -o none 2>/tmp/err \
+            || falha "$(traduz "$(cat /tmp/err)")"
+
+          if [ "$TAM" = Standard_NV6ads_A10_v5 ]; then
+            echo "Instalando driver NVIDIA..."
+            az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
+              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
+              || echo "::warning::Driver NVIDIA nao instalou: $(head -c 300 /tmp/err)"
+          fi
+
+          echo "Rodando configuracao dentro do Windows..."
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+            --scripts @/tmp/primeiro-boot.ps1 --parameters "AuthKey=$AUTHKEY" "NomePC=$VM" -o none 2>/tmp/err \
+            || echo "::warning::Configuracao interna falhou: $(head -c 300 /tmp/err)"
+
+          {
+            echo "## PC CRIADO"
+            echo "| Item | Valor |"; echo "|---|---
