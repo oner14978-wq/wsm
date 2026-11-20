@@ -165,77 +165,6 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- 2) VERIFICAR ASSINATURA, ESTADO, OFERTA E PERMISSOES ----
-      - name: Verificar assinatura, estado, oferta e permissoes
-        run: |
-          set +e
-          set -uo pipefail
-          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
-          FALHOU=0
-          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
-          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          FILTRO="!starts_with(name,'N/A(tenant')"
-          az account list --all --refresh -o none 2>/dev/null
-          CONTA=$(az account show --query user.name -o tsv 2>/dev/null || echo "?")
-          TOTAL=$(az account list --all --query "[?$FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0)
-          ATIVAS=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0)
-
-          if [ "${TOTAL:-0}" = 0 ]; then
-            if [ -n "${AZ_CID:-}" ]; then
-              falha "O app do Azure (AZ_CLIENT_ID) nao enxerga nenhuma assinatura. Crie em https://azure.microsoft.com/free, ou apague os Secrets AZ_* para refazer pelo login por codigo."
-            fi
-            falha "FALTA ASSINATURA: a conta $CONTA nao tem assinatura. Crie em https://azure.microsoft.com/free e rode de novo."
-          fi
-          if [ "${ATIVAS:-0}" = 0 ]; then
-            ESTADOS=$(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')
-            falha "ASSINATURA NAO ESTA ATIVA (estado: $ESTADOS). Resolva em portal.azure.com > Assinaturas."
-          fi
-
-          SUB="${AZ_SID:-}"
-          if [ -z "$SUB" ]; then
-            SUB=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | [0].id" -o tsv)
-          fi
-          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura informada nao esta acessivel. Detalhe: $(head -c 300 /tmp/err)"
-          NOME=$(az account show --query name -o tsv)
-
-          INFO=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB?api-version=2020-01-01" -o json 2>/dev/null || echo '{}')
-          QUOTA=$(echo "$INFO" | jq -r '.subscriptionPolicies.quotaId // "desconhecida"')
-          LIMITE=$(echo "$INFO" | jq -r '.subscriptionPolicies.spendingLimit // "desconhecido"')
-          NOTA=""
-          case "$QUOTA" in
-            FreeTrial*) NOTA="Teste gratuito: o credito e limitado e a GPU NVIDIA normalmente fica bloqueada. Para usar GPU, faca Upgrade para pagamento conforme o uso no portal." ;;
-          esac
-          if [ "$LIMITE" = "On" ]; then NOTA="$NOTA Limite de gasto ativado: alguns tamanhos de VM podem ser bloqueados."; fi
-
-          PERM=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" --query "value[].actions[]" -o tsv 2>/dev/null || true)
-          if [ -z "$PERM" ]; then
-            PODE="nao foi possivel verificar (sera testado ao criar)"
-          elif echo "$PERM" | grep -qxE '\*|Microsoft\.Compute/\*|Microsoft\.Compute/virtualMachines/write'; then
-            PODE="sim"
-          else
-            PODE="nao"
-          fi
-          if [ "$PODE" = "nao" ]; then
-            falha "SEM PERMISSAO PARA CRIAR MAQUINAS VIRTUAIS em $NOME. De o papel Contributor (ou Owner) para $CONTA em portal.azure.com > Assinaturas > Controle de acesso (IAM)."
-          fi
-
-          echo "Assinatura em uso: $NOME"
-          echo "ASSINATURA=$NOME" >> "$GITHUB_ENV"
-          echo "OFERTA=$QUOTA" >> "$GITHUB_ENV"
-          {
-            echo "## VERIFICACAO DA ASSINATURA"
-            echo "| Item | Valor |"; echo "|---|---|"
-            echo "| Conta autenticada | $CONTA |"
-            echo "| Assinatura | $NOME |"
-            echo "| ID da assinatura | \`$SUB\` |"
-            echo "| Estado | Enabled (ativa) |"
-            echo "| Tipo de oferta | $QUOTA |"
-            echo "| Limite de gasto | $LIMITE |"
-            echo "| Pode criar VMs | $PODE |"
-            if [ -n "$NOTA" ]; then echo ""; echo "**Atencao:** $NOTA"; fi
-            echo ""
-          } >> "$GITHUB_STEP_SUMMARY"
-
       # ---- 3) PREPARAR: provedores, regiao, GPU e cota ----
       - name: Preparar recursos e verificar GPU / cota
         id: prep
@@ -343,4 +272,84 @@ jobs:
           }
           echo "::add-mask::$AUTHKEY"
 
-          SE
+          SENHA="Aa1-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
+          echo "::add-mask::$SENHA"
+
+          cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
+          param(
+            [Parameter(Mandatory = $true)][string]$AuthKey,
+            [string]$NomePC = 'gamerpc'
+          )
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
+          $LogFile = 'C:\setup-logs\primeiro-boot.log'
+          function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
+          Log 'Inicio (a chave do Tailscale nunca e gravada neste log)'
+
+          # Area de Trabalho Remota
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Log 'RDP ligado'
+
+          # Tailscale
+          $msi = 'C:\setup-logs\tailscale.msi'
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 10
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key=$AuthKey --hostname=$NomePC --unattended 2>&1 | Out-Null
+          Log 'Tailscale conectado'
+          PSEOF
+
+          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
+
+          echo "Criando a VM $TAM em $REG (leva alguns minutos)..."
+          az vm create -g "$RG" -n "$VM" -l "$REG" --size "$TAM" \
+            --image MicrosoftWindowsDesktop:windows-11:win11-23h2-pro:latest \
+            --admin-username "$USUARIO" --admin-password "$SENHA" \
+            --license-type Windows_Client --os-disk-size-gb 256 \
+            --public-ip-sku Standard --nsg-rule NONE -o none 2>/tmp/err \
+            || falha "$(traduz "$(cat /tmp/err)")"
+
+          if [ "$TAM" = Standard_NV6ads_A10_v5 ]; then
+            echo "Instalando driver NVIDIA..."
+            az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
+              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
+              || echo "::warning::Driver NVIDIA nao instalou: $(head -c 300 /tmp/err)"
+          fi
+
+          echo "Rodando configuracao dentro do Windows..."
+          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+            --scripts @/tmp/primeiro-boot.ps1 --parameters "AuthKey=$AUTHKEY" "NomePC=$VM" -o none 2>/tmp/err \
+            || echo "::warning::Configuracao interna falhou: $(head -c 300 /tmp/err)"
+
+          {
+            echo "## PC CRIADO"
+            echo "| Item | Valor |"; echo "|---|---|"
+            echo "| Nome na rede Tailscale | $VM |"
+            echo "| Usuario | $USUARIO |"
+            echo "| Senha | \`$SENHA\` |"
+            echo "| Tamanho | $TAM |"
+            echo "| Regiao | $REG |"
+            echo "| Memoria | $RAM |"
+            echo "| GPU | $GPU |"
+            echo ""
+            echo "Conecte pelo Tailscale (Area de Trabalho Remota) usando o nome $VM. Anote a senha agora."
+            if [ -n "${AVISO// /}" ]; then echo ""; echo "**Aviso:** $AVISO"; fi
+            echo ""
+            echo "**Atencao:** VM ligada gasta credito. Rode a acao desligar quando terminar."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---- 5) OUTRAS ACOES (RECONSTRUIDO) ----
+      - name: Status, ligar, desligar, reiniciar ou destruir
+        if: inputs.acao != 'criar'
+        run: |
+          set +e
+          set -uo pipefail
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          FALHOU=0
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel executar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          if [ "$ACAO" != destruir ]; then
+            az vm show
