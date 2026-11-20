@@ -48,6 +48,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
         run: |
+          set +e
           set -uo pipefail
           echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
           FALHOU=0
@@ -158,6 +159,7 @@ jobs:
       # ---- 2) VERIFICAR ASSINATURA, ESTADO, OFERTA E PERMISSOES ----
       - name: Verificar assinatura, estado, oferta e permissoes
         run: |
+          set +e
           set -uo pipefail
           echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
           FALHOU=0
@@ -232,6 +234,7 @@ jobs:
         env:
           AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
+          set +e
           set -uo pipefail
           echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
           FALHOU=0
@@ -313,6 +316,7 @@ jobs:
           GPU: ${{ steps.prep.outputs.gpu }}
           AVISO: ${{ steps.prep.outputs.aviso }}
         run: |
+          set +e
           set -uo pipefail
           echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
           FALHOU=0
@@ -341,5 +345,4 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $ProgressPreference = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
-          $LogFile = 'C:\setup-logs\
+          New-Item -ItemType Directory -Force
