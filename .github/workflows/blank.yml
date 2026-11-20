@@ -138,6 +138,34 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # ---- 2) DIAGNOSTICO DA CONTA (nao bloqueia: so informa e segue) ----
+      - name: Diagnostico da conta (so informa, nao bloqueia)
+        run: |
+          set +e
+          set -uo pipefail
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          CONTA=$(az account show --query user.name -o tsv 2>/dev/null || echo "desconhecida")
+          TOTAL=$(az account list --all --query "[?!starts_with(name,'N/A(tenant')] | length(@)" -o tsv 2>/dev/null || echo 0)
+          ATIVAS=$(az account list --all --query "[?state=='Enabled' && !starts_with(name,'N/A(tenant')] | length(@)" -o tsv 2>/dev/null || echo 0)
+          NOME=$(az account list --all --query "[?state=='Enabled' && !starts_with(name,'N/A(tenant')] | [0].name" -o tsv 2>/dev/null)
+          QUOTA=$(az rest --method get --url "https://management.azure.com/subscriptions/$(az account list --all --query "[?state=='Enabled'] | [0].id" -o tsv 2>/dev/null)?api-version=2020-01-01" --query subscriptionPolicies.quotaId -o tsv 2>/dev/null)
+          {
+            echo "## Diagnostico da conta Azure"
+            echo "| Item | Valor |"; echo "|---|---|"
+            echo "| Conta | ${CONTA:-desconhecida} |"
+            echo "| Assinaturas encontradas | ${TOTAL:-0} (ativas: ${ATIVAS:-0}) |"
+            echo "| Assinatura em uso | ${NOME:-nenhuma} |"
+            echo "| Tipo de oferta | ${QUOTA:-desconhecido} |"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Conta: ${CONTA:-desconhecida} | assinaturas: ${TOTAL:-0} | ativas: ${ATIVAS:-0}"
+          if [ "${ATIVAS:-0}" = 0 ]; then
+            echo "::warning::Esta conta NAO tem assinatura ativa. O workflow vai continuar, mas a criacao do PC deve falhar mais adiante."
+            echo "AVISO: sem assinatura ativa. Crie em https://azure.microsoft.com/free" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          case "${QUOTA:-}" in FreeTrial*) echo "::notice::Teste gratuito: a GPU NVIDIA normalmente fica bloqueada; o PC deve sair sem GPU." ;; esac
+          exit 0
+
       # ---- 3) PREPARAR: provedores, regiao, GPU e cota ----
       - name: Preparar recursos e verificar GPU / cota
         id: prep
@@ -312,38 +340,4 @@ jobs:
             Log 'RDP ligado'
           } catch { Falhou 'rdp' $_ }
 
-          # ---------- 4) Tailscale: instalar, autenticar com TAILSCALE_AUTH_KEY, aguardar, achar o IP ----------
-          try {
-            $msi = 'C:\setup-logs\tailscale.msi'
-            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-            $ts = 'C:\Program Files\Tailscale\tailscale.exe'
-            for ($i = 0; $i -lt 30 -and -not (Test-Path $ts); $i++) { Start-Sleep -Seconds 2 }
-            if (-not (Test-Path $ts)) { throw 'Tailscale nao foi instalado' }
-            Set-Service -Name Tailscale -StartupType Automatic      # inicia junto com o Windows
-            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            Log 'Tailscale instalado'
-
-            & $ts up "--auth-key=$AuthKey" "--hostname=$NomePC" '--unattended' "--advertise-tags=$Tag" 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-              $res.tag_aplicada = $true
-            } else {
-              Log "Tag $Tag nao autorizada por esta chave; tentando sem tag"
-              & $ts up "--auth-key=$AuthKey" "--hostname=$NomePC" '--unattended' 2>&1 | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw 'tailscale up falhou (chave invalida, expirada ou ja usada?)' }
-            }
-
-            $estado = ''
-            for ($i = 0; $i -lt 36; $i++) {                         # ate 3 minutos
-              try { $estado = (& $ts status --json | ConvertFrom-Json).BackendState } catch { $estado = '' }
-              if ($estado -eq 'Running') { break }
-              Start-Sleep -Seconds 5
-            }
-            $res.tailscale_estado = if ($estado) { $estado } else { 'sem resposta' }
-            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($ip) { $res.tailscale_ip = "$ip".Trim() }
-            Log "Tailscale estado=$($res.tailscale_estado) ip=$($res.tailscale_ip)"
-          } catch { Falhou 'tailscale' $_ }
-
-          # ---------- 5) Sunshine (servidor de streaming para o Moonlight) ------
+          # ---------- 4) Tailscale: instalar, autenticar com TAILSCALE_AUTH_KEY, aguardar, 
