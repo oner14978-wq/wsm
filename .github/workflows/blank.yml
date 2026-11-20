@@ -242,12 +242,14 @@ jobs:
           echo "gpu=$GPU" >> "$GITHUB_OUTPUT"
           echo "aviso=$(echo "$AVISO" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
 
-      # ---- 4) CRIAR O PC (RECONSTRUIDO: o anexo original veio cortado aqui) ----
+      # ---- 4) CRIAR O PC ----
       - name: Criar o PC (VM real no Azure)
         id: criar
         if: inputs.acao == 'criar'
         env:
           AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN || github.token }}
           TAM: ${{ steps.prep.outputs.tamanho }}
           REG: ${{ steps.prep.outputs.regiao }}
           RAM: ${{ steps.prep.outputs.ram }}
@@ -259,10 +261,10 @@ jobs:
           echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
           FALHOU=0
           trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
-          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel concluir"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           traduz() {
             case "$1" in
-              *AuthorizationFailed*|*"does not have authorization"*) echo "SEM PERMISSAO: a conta/app precisa ser Contributor ou Owner da assinatura." ;;
+              *AuthorizationFailed*|*"does not have authorization"*) echo "SEM PERMISSAO: a conta precisa ser Contributor ou Owner da assinatura." ;;
               *SpendingLimitReached*|*ReadOnlyDisabledSubscription*|*SubscriptionDisabled*|*PaymentRequired*) echo "SEM CREDITO: assinatura desativada ou com limite de gasto atingido." ;;
               *QuotaExceeded*|*"quota"*|*OperationNotAllowed*) echo "SEM COTA de vCPU na regiao $REG. Peca aumento em Uso + cotas." ;;
               *SkuNotAvailable*|*AllocationFailed*|*ZonalAllocationFailed*) echo "O Azure esta sem capacidade desse tamanho agora em $REG. Tente mais tarde." ;;
@@ -270,86 +272,78 @@ jobs:
               *) echo "Erro do Azure: $(echo "$1" | tail -c 400)" ;;
             esac
           }
-          echo "::add-mask::$AUTHKEY"
-
-          SENHA="Aa1-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
-          echo "::add-mask::$SENHA"
-
+          # Script do primeiro boot do Windows (embutido neste arquivo; nao precisa de scripts/primeiro-boot.ps1)
           cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
+          # scripts/primeiro-boot.ps1
+          # Roda UMA vez dentro do Windows 11, via "az vm run-command invoke", como SYSTEM.
+          # A chave do Tailscale e a senha chegam por parametro e NUNCA sao gravadas em log.
           param(
             [Parameter(Mandatory = $true)][string]$AuthKey,
-            [string]$NomePC = 'gamerpc'
+            [Parameter(Mandatory = $true)][string]$Senha,
+            [string]$NomePC  = 'gamerpc',
+            [string]$Usuario = 'Rafael',
+            [string]$Tag     = 'tag:gamerpc'
           )
+
           $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
+          $ProgressPreference    = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
           New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
           $LogFile = 'C:\setup-logs\primeiro-boot.log'
           function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
-          Log 'Inicio (a chave do Tailscale nunca e gravada neste log)'
+          Log 'Inicio (chave do Tailscale e senha nunca sao gravadas neste log)'
 
-          # Area de Trabalho Remota
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-          Log 'RDP ligado'
+          $res = [ordered]@{
+            usuario = $Usuario; conta_admin = $false; login_valido = $false
+            tailscale_estado = 'nao instalado'; tailscale_ip = ''; tag_aplicada = $false
+            sunshine = 'nao instalado'; erros = @()
+          }
+          function Falhou($etapa, $e) { $res.erros += "$etapa : $($e.Exception.Message)"; Log "ERRO em $etapa : $($e.Exception.Message)" }
 
-          # Tailscale
-          $msi = 'C:\setup-logs\tailscale.msi'
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          Start-Sleep -Seconds 10
-          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key=$AuthKey --hostname=$NomePC --unattended 2>&1 | Out-Null
-          Log 'Tailscale conectado'
-          PSEOF
+          # ---------- 1) Conta do Windows: Rafael, administrador, senha gerada ----------
+          try {
+            $sec = ConvertTo-SecureString $Senha -AsPlainText -Force
+            if (Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires $true -AccountNeverExpires
+              Enable-LocalUser -Name $Usuario
+            } else {
+              New-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+            }
+            $grpAdmin = (Get-LocalGroup -SID 'S-1-5-32-544').Name
+            $grpRdp   = (Get-LocalGroup -SID 'S-1-5-32-555').Name
+            Add-LocalGroupMember -Group $grpAdmin -Member $Usuario -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group $grpRdp   -Member $Usuario -ErrorAction SilentlyContinue
+            $res.conta_admin = [bool](Get-LocalGroupMember -Group $grpAdmin | Where-Object { $_.Name -like "*\$Usuario" })
 
-          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
+            Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+            $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext('Machine')
+            $res.login_valido = [bool]$ctx.ValidateCredentials($Usuario, $Senha)
+            Log "Conta $Usuario pronta (admin=$($res.conta_admin), login_valido=$($res.login_valido))"
+          } catch { Falhou 'conta' $_ }
 
-          echo "Criando a VM $TAM em $REG (leva alguns minutos)..."
-          az vm create -g "$RG" -n "$VM" -l "$REG" --size "$TAM" \
-            --image MicrosoftWindowsDesktop:windows-11:win11-23h2-pro:latest \
-            --admin-username "$USUARIO" --admin-password "$SENHA" \
-            --license-type Windows_Client --os-disk-size-gb 256 \
-            --public-ip-sku Standard --nsg-rule NONE -o none 2>/tmp/err \
-            || falha "$(traduz "$(cat /tmp/err)")"
+          # ---------- 2) Login automatico (o Sunshine precisa de uma sessao aberta) ----------
+          try {
+            $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+            Set-ItemProperty -Path $wl -Name AutoAdminLogon    -Value '1'
+            Set-ItemProperty -Path $wl -Name DefaultUserName   -Value $Usuario
+            Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
+            Set-ItemProperty -Path $wl -Name DefaultPassword   -Value $Senha
+            Log 'Login automatico configurado'
+          } catch { Falhou 'autologon' $_ }
 
-          if [ "$TAM" = Standard_NV6ads_A10_v5 ]; then
-            echo "Instalando driver NVIDIA..."
-            az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
-              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
-              || echo "::warning::Driver NVIDIA nao instalou: $(head -c 300 /tmp/err)"
-          fi
+          # ---------- 3) Area de Trabalho Remota (reserva; acesso so pela rede Tailscale) ----------
+          try {
+            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+            Log 'RDP ligado'
+          } catch { Falhou 'rdp' $_ }
 
-          echo "Rodando configuracao dentro do Windows..."
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
-            --scripts @/tmp/primeiro-boot.ps1 --parameters "AuthKey=$AUTHKEY" "NomePC=$VM" -o none 2>/tmp/err \
-            || echo "::warning::Configuracao interna falhou: $(head -c 300 /tmp/err)"
-
-          {
-            echo "## PC CRIADO"
-            echo "| Item | Valor |"; echo "|---|---|"
-            echo "| Nome na rede Tailscale | $VM |"
-            echo "| Usuario | $USUARIO |"
-            echo "| Senha | \`$SENHA\` |"
-            echo "| Tamanho | $TAM |"
-            echo "| Regiao | $REG |"
-            echo "| Memoria | $RAM |"
-            echo "| GPU | $GPU |"
-            echo ""
-            echo "Conecte pelo Tailscale (Area de Trabalho Remota) usando o nome $VM. Anote a senha agora."
-            if [ -n "${AVISO// /}" ]; then echo ""; echo "**Aviso:** $AVISO"; fi
-            echo ""
-            echo "**Atencao:** VM ligada gasta credito. Rode a acao desligar quando terminar."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ---- 5) OUTRAS ACOES (RECONSTRUIDO) ----
-      - name: Status, ligar, desligar, reiniciar ou destruir
-        if: inputs.acao != 'criar'
-        run: |
-          set +e
-          set -uo pipefail
-          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
-          FALHOU=0
-          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
-          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel executar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          if [ "$ACAO" != destruir ]; then
-            az vm show
+          # ---------- 4) Tailscale: instalar, autenticar com TAILSCALE_AUTH_KEY, aguardar, achar o IP ----------
+          try {
+            $msi = 'C:\setup-logs\tailscale.msi'
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+            $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+            for ($i = 0; $i -lt 30 -and -not (Test-Path $ts); $i++) { Start-Sleep -Seconds 2 }
+            if (-not (Test-Path $ts)) { throw 'Ta
