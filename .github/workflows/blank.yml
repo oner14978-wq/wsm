@@ -33,29 +33,6 @@ jobs:
     timeout-minutes: 90
     steps:
       # ---- 1) LOGIN NO AZURE com acesso de servico (secret AZURE_CREDENTIALS) ----
-      - name: Conferir o secret AZURE_CREDENTIALS
-        env:
-          CRED: ${{ secrets.AZURE_CREDENTIALS }}
-        run: |
-          set +e
-          set -uo pipefail
-          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
-          if [ -z "${CRED:-}" ]; then
-            MSG="FALTA O SECRET AZURE_CREDENTIALS. Crie o acesso no Azure Cloud Shell (comando no chat) e salve o JSON em Settings > Secrets and variables > Actions com o nome AZURE_CREDENTIALS."
-            echo ""; echo "=============== ERRO ==============="; echo "$MSG"; echo "===================================="
-            echo "::error::$MSG"
-            { echo "## Nao foi possivel continuar"; echo ""; echo "$MSG"; } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          if ! echo "$CRED" | jq -e '.clientId and .clientSecret and .tenantId and .subscriptionId' >/dev/null 2>&1; then
-            MSG="O secret AZURE_CREDENTIALS existe, mas nao e um JSON valido com clientId, clientSecret, tenantId e subscriptionId. Cole de novo o JSON inteiro, com as chaves { }."
-            echo ""; echo "=============== ERRO ==============="; echo "$MSG"; echo "===================================="
-            echo "::error::$MSG"
-            { echo "## Nao foi possivel continuar"; echo ""; echo "$MSG"; } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Secret AZURE_CREDENTIALS encontrado e com o formato certo."
-
       - name: Login Azure (acesso de servico)
         uses: azure/login@v2
         with:
