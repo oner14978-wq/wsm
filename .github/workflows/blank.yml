@@ -297,6 +297,7 @@ jobs:
 
           $res = [ordered]@{
             usuario = $Usuario; conta_admin = $false; login_valido = $false
+            conta_microsoft = 'nao configurado'; nome_pc = $env:COMPUTERNAME
             tailscale_estado = 'nao instalado'; tailscale_ip = ''; tag_aplicada = $false
             sunshine = 'nao instalado'; erros = @()
           }
@@ -323,21 +324,19 @@ jobs:
             Log "Conta $Usuario pronta (admin=$($res.conta_admin), login_valido=$($res.login_valido))"
           } catch { Falhou 'conta' $_ }
 
+          # ---------- 1b) Somente conta local (sem Microsoft) e nome do computador ----------
+          try {
+            $pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+            if (-not (Test-Path $pol)) { New-Item -Path $pol | Out-Null }
+            Set-ItemProperty -Path $pol -Name NoConnectedUser -Value 3 -Type DWord   # bloqueia entrar/vincular conta Microsoft
+            $res.conta_microsoft = 'bloqueada (somente conta local)'
+            if ($env:COMPUTERNAME -ine $NomePC) { Rename-Computer -NewName $NomePC -Force -ErrorAction Stop }
+            $res.nome_pc = $NomePC
+            Log "Conta Microsoft bloqueada; nome do computador = $NomePC"
+          } catch { Falhou 'conta-microsoft-nome' $_ }
+
           # ---------- 2) Login automatico (o Sunshine precisa de uma sessao aberta) ----------
           try {
             $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
             Set-ItemProperty -Path $wl -Name AutoAdminLogon    -Value '1'
-            Set-ItemProperty -Path $wl -Name DefaultUserName   -Value $Usuario
-            Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
-            Set-ItemProperty -Path $wl -Name DefaultPassword   -Value $Senha
-            Log 'Login automatico configurado'
-          } catch { Falhou 'autologon' $_ }
-
-          # ---------- 3) Area de Trabalho Remota (reserva; acesso so pela rede Tailscale) ----------
-          try {
-            Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-            Log 'RDP ligado'
-          } catch { Falhou 'rdp' $_ }
-
-          # ---------- 4) Tailscale: instalar, autenticar com TAILSCALE_AUTH_KEY, aguardar, 
+            Set-I
