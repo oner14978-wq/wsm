@@ -49,7 +49,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
         run: |
           set -uo pipefail
-          falha() { echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          FALHOU=0
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           FILTRO="!starts_with(name,'N/A(tenant')"
 
           logado=0
@@ -156,7 +159,10 @@ jobs:
       - name: Verificar assinatura, estado, oferta e permissoes
         run: |
           set -uo pipefail
-          falha() { echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          FALHOU=0
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           FILTRO="!starts_with(name,'N/A(tenant')"
           az account list --all --refresh -o none 2>/dev/null
           CONTA=$(az account show --query user.name -o tsv 2>/dev/null || echo "?")
@@ -227,7 +233,10 @@ jobs:
           AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -uo pipefail
-          falha() { echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          FALHOU=0
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
 
           if [ -z "$AUTHKEY" ]; then
             falha "FALTA O SECRET TAILSCALE_AUTH_KEY. Crie em Settings > Secrets and variables > Actions e rode de novo."
@@ -305,7 +314,10 @@ jobs:
           AVISO: ${{ steps.prep.outputs.aviso }}
         run: |
           set -uo pipefail
-          falha() { echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          echo "=== INICIO DO PASSO: $(date -u +%H:%M:%S) UTC ==="
+          FALHOU=0
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ "$FALHOU" = 0 ]; then echo "ERRO INESPERADO: o passo terminou com codigo $rc (linha $LINENO do script)"; echo "::error::Passo falhou com codigo $rc na linha $LINENO"; { echo "## ERRO INESPERADO"; echo "O passo terminou com codigo $rc na linha $LINENO. Abra o log do passo e veja as ultimas linhas."; } >> "$GITHUB_STEP_SUMMARY"; fi' EXIT
+          falha() { FALHOU=1; echo ""; echo "=============== ERRO ==============="; echo "$1"; echo "===================================="; echo "::error::$1"; { echo "## Nao foi possivel criar o PC"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
           traduz() {
             case "$1" in
               *AuthorizationFailed*|*"does not have authorization"*) echo "SEM PERMISSAO: a conta/app precisa ser Contributor ou Owner da assinatura." ;;
@@ -330,46 +342,4 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
-          $LogFile = 'C:\setup-logs\primeiro-boot.log'
-          function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
-          Log 'Inicio (a chave do Tailscale nunca e gravada neste log)'
-
-          # Area de Trabalho Remota
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
-          Log 'RDP ligado'
-
-          # Tailscale
-          $msi = 'C:\setup-logs\tailscale.msi'
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          Start-Sleep -Seconds 10
-          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key=$AuthKey --hostname=$NomePC --unattended 2>&1 | Out-Null
-          Log 'Tailscale conectado'
-          PSEOF
-
-          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
-
-          echo "Criando a VM $TAM em $REG (leva alguns minutos)..."
-          az vm create -g "$RG" -n "$VM" -l "$REG" --size "$TAM" \
-            --image MicrosoftWindowsDesktop:windows-11:win11-23h2-pro:latest \
-            --admin-username "$USUARIO" --admin-password "$SENHA" \
-            --license-type Windows_Client --os-disk-size-gb 256 \
-            --public-ip-sku Standard --nsg-rule NONE -o none 2>/tmp/err \
-            || falha "$(traduz "$(cat /tmp/err)")"
-
-          if [ "$TAM" = Standard_NV6ads_A10_v5 ]; then
-            echo "Instalando driver NVIDIA..."
-            az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
-              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
-              || echo "::warning::Driver NVIDIA nao instalou: $(head -c 300 /tmp/err)"
-          fi
-
-          echo "Rodando configuracao dentro do Windows..."
-          az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
-            --scripts @/tmp/primeiro-boot.ps1 --parameters "AuthKey=$AUTHKEY" "NomePC=$VM" -o none 2>/tmp/err \
-            || echo "::warning::Configuracao interna falhou: $(head -c 300 /tmp/err)"
-
-          {
-            echo "## PC CRIADO"
-            echo "| Item | Valor |"; echo "|---|---
+          $LogFile = 'C:\setup-logs\
