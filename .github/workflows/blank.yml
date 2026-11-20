@@ -42,27 +42,62 @@ jobs:
           subscription-id: ${{ env.AZ_SID }}
           allow-no-subscriptions: true
 
-      # ---- 1b) SEM AZ_*: login por codigo (so na primeira vez) e cria AZ_* sozinho ----
-      - name: Login Azure por codigo e criar AZ_CLIENT_ID / AZ_TENANT_ID
+      # ---- 1b) SEM AZ_*: login por codigo (so na primeira vez); espera a assinatura; cria AZ_* sozinho ----
+      - name: Login Azure por codigo, aguardar assinatura e criar AZ_CLIENT_ID / AZ_TENANT_ID
         if: env.AZ_CID == '' || env.AZ_TID == ''
         env:
           GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          falha() { echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
+          FILTRO="!starts_with(name,'N/A(tenant')"
+
           logado=0
           for t in 1 2 3; do
             echo "::notice title=Login Azure::Tentativa $t de 3 - abra o link e digite o codigo mostrado neste passo"
             echo ">>> TENTATIVA $t de 3: abra o link abaixo e digite o codigo que aparecer <<<"
-            az login --use-device-code -o none 2>&1 | tee /tmp/azlogin.log && rc=0 || rc=1
+            az login --use-device-code --allow-no-subscriptions -o none 2>&1 | tee /tmp/azlogin.log && rc=0 || rc=1
             if [ "$rc" = 0 ]; then logado=1; break; fi
-            if grep -q "No subscriptions found" /tmp/azlogin.log; then
-              echo "::error::Essa conta do Azure NAO tem assinatura. Crie uma em azure.com/free (ou entre com outra conta) e rode de novo."
-              exit 1
-            fi
             echo "Login nao concluido (codigo expirou ou foi recusado). Gerando outro..."
           done
-          [ "$logado" = 1 ] || { echo "::error::Login no Azure nao concluido. Rode a acao de novo e entre no link logo que o codigo aparecer."; exit 1; }
-          SUB=$(az account show --query id -o tsv)
+          [ "$logado" = 1 ] || falha "LOGIN NAO CONCLUIDO. Rode a acao de novo e entre no link logo que o codigo aparecer."
+
+          CONTA=$(az account show --query user.name -o tsv 2>/dev/null)
+          conta_total() { az account list --all --refresh --query "[?$FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0; }
+          conta_ativas() { az account list --all --refresh --query "[?state=='Enabled' && $FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0; }
+
+          if [ "$(conta_total)" = 0 ]; then
+            {
+              echo "## FALTA ASSINATURA DO AZURE"
+              echo ""
+              echo "A conta **$CONTA** entrou no Azure, mas ainda nao tem assinatura. O workflow NAO cria assinatura por voce: o cadastro e feito por voce, com a Microsoft."
+              echo ""
+              echo "1. Abra https://azure.microsoft.com/free e toque em **Comece gratuitamente**."
+              echo "2. Entre com o MESMO e-mail: **$CONTA**."
+              echo "3. Preencha os dados, confirme o telefone e o cartao (a Microsoft usa o cartao so para verificar a identidade)."
+              echo "4. Quando terminar, volte aqui. Este workflow fica verificando a cada 30 segundos, por ate 30 minutos, e continua sozinho quando a assinatura aparecer."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice title=Falta assinatura::Crie a assinatura em https://azure.microsoft.com/free com o e-mail $CONTA. O workflow aguarda ate 30 minutos."
+            echo "FALTA ASSINATURA. Crie em https://azure.microsoft.com/free com o e-mail $CONTA. Aguardando..."
+            for i in $(seq 1 60); do
+              sleep 30
+              [ "$(conta_total)" != 0 ] && break
+              echo "Aguardando a assinatura... ($i de 60)"
+            done
+            [ "$(conta_total)" != 0 ] || falha "ASSINATURA NAO APARECEU em 30 minutos. Termine o cadastro em https://azure.microsoft.com/free com o e-mail $CONTA e rode a acao de novo."
+          fi
+
+          if [ "$(conta_ativas)" = 0 ]; then
+            for i in $(seq 1 20); do
+              sleep 30
+              [ "$(conta_ativas)" != 0 ] && break
+              echo "Assinatura ainda sendo ativada... ($i de 20)"
+            done
+          fi
+          [ "$(conta_ativas)" != 0 ] || falha "ASSINATURA NAO ESTA ATIVA (estado: $(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')). Credito acabado, pagamento pendente ou ativacao em andamento. Veja portal.azure.com > Assinaturas."
+
+          SUB=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | [0].id" -o tsv)
+          az account set --subscription "$SUB"
           TEN=$(az account show --query tenantId -o tsv)
           NAME=gamerpc-gh
           APP=$(az ad app list --display-name "$NAME" --query "[0].appId" -o tsv)
@@ -76,7 +111,7 @@ jobs:
             if [ -n "$(az role assignment list --assignee "$APP" --scope "/subscriptions/$SUB" --query '[0].id' -o tsv 2>/dev/null)" ]; then ok=1; break; fi
             sleep 15
           done
-          [ "$ok" = 1 ] || { echo "::error::Sua conta precisa ser Owner da assinatura para dar a permissao Contributor."; exit 1; }
+          [ "$ok" = 1 ] || falha "SEM PERMISSAO: sua conta precisa ser Owner da assinatura para dar o papel Contributor ao app do GitHub."
           CRED="gh-$(echo "$BRANCH" | sed 's/[^A-Za-z0-9-]/-/g')"
           SUBJ="repo:${REPO}:ref:refs/heads/${BRANCH}"
           if [ -z "$(az ad app federated-credential list --id "$APP" --query "[?name=='$CRED'].name" -o tsv)" ]; then
@@ -104,28 +139,76 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # ---- 2) VERIFICAR ASSINATURA ----
-      - name: Verificar assinatura do Azure
+      # ---- 2) VERIFICAR ASSINATURA, ESTADO, OFERTA E PERMISSOES ----
+      - name: Verificar assinatura, estado, oferta e permissoes
         run: |
           set -uo pipefail
           falha() { echo "::error::$1"; { echo "## Nao foi possivel continuar"; echo ""; echo "$1"; } >> "$GITHUB_STEP_SUMMARY"; exit 1; }
-          TOTAL=$(az account list --all --query "length(@)" -o tsv 2>/dev/null || echo 0)
-          ATIVAS=$(az account list --all --query "[?state=='Enabled'] | length(@)" -o tsv 2>/dev/null || echo 0)
+          FILTRO="!starts_with(name,'N/A(tenant')"
+          az account list --all --refresh -o none 2>/dev/null
+          CONTA=$(az account show --query user.name -o tsv 2>/dev/null || echo "?")
+          TOTAL=$(az account list --all --query "[?$FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0)
+          ATIVAS=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | length(@)" -o tsv 2>/dev/null || echo 0)
+
           if [ "${TOTAL:-0}" = 0 ]; then
-            falha "FALTA ASSINATURA: essa conta do Azure nao tem nenhuma assinatura. O Azure exige cadastro (com cartao para verificacao) em azure.com/free. O workflow nao consegue criar isso por voce."
+            if [ -n "${AZ_CID:-}" ]; then
+              falha "O app do Azure (AZ_CLIENT_ID) nao enxerga nenhuma assinatura. Se a assinatura ainda nao existe, crie em https://azure.microsoft.com/free. Se ja existe, o dono precisa dar o papel Contributor ao app gamerpc-gh, ou voce apaga os Secrets AZ_* para o workflow refazer a configuracao pelo login por codigo."
+            fi
+            falha "FALTA ASSINATURA: a conta $CONTA nao tem assinatura. Crie em https://azure.microsoft.com/free com esse e-mail e rode de novo."
           fi
           if [ "${ATIVAS:-0}" = 0 ]; then
-            ESTADOS=$(az account list --all --query "[].state" -o tsv | sort -u | tr '\n' ' ')
-            falha "ASSINATURA SEM USO: existe, mas nao esta ativa (estado: $ESTADOS). Isso costuma indicar credito acabado, teste gratuito expirado ou pagamento pendente. Resolva em portal.azure.com > Assinaturas."
+            ESTADOS=$(az account list --all --query "[?$FILTRO].state" -o tsv | sort -u | tr '\n' ' ')
+            falha "ASSINATURA NAO ESTA ATIVA (estado: $ESTADOS). Isso costuma ser credito acabado, teste gratuito expirado ou pagamento pendente. O dono da conta precisa resolver em portal.azure.com > Assinaturas."
           fi
+
           SUB="${AZ_SID:-}"
           if [ -z "$SUB" ]; then
-            SUB=$(az account list --all --query "[?state=='Enabled'] | [0].id" -o tsv)
+            SUB=$(az account list --all --query "[?state=='Enabled' && $FILTRO] | [0].id" -o tsv)
           fi
-          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura $SUB nao esta acessivel por esta conta/app. Detalhe: $(head -c 300 /tmp/err)"
+          az account set --subscription "$SUB" 2>/tmp/err || falha "A assinatura informada nao esta acessivel por esta conta/app. Detalhe: $(head -c 300 /tmp/err)"
           NOME=$(az account show --query name -o tsv)
+
+          # Oferta (tipo de assinatura) e limite de gasto
+          INFO=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB?api-version=2020-01-01" -o json 2>/dev/null || echo '{}')
+          QUOTA=$(echo "$INFO" | jq -r '.subscriptionPolicies.quotaId // "desconhecida"')
+          LIMITE=$(echo "$INFO" | jq -r '.subscriptionPolicies.spendingLimit // "desconhecido"')
+          CREDITO="o Azure nao informa o saldo por API: confira em portal.azure.com > Assinaturas > Cost Management"
+          NOTA=""
+          case "$QUOTA" in
+            FreeTrial*) NOTA="Teste gratuito: o credito e limitado e a GPU NVIDIA normalmente fica bloqueada. Para usar GPU, o dono precisa fazer Upgrade para pagamento conforme o uso no portal." ;;
+          esac
+          if [ "$LIMITE" = "On" ]; then NOTA="$NOTA Limite de gasto ativado: alguns tamanhos de VM podem ser bloqueados."; fi
+
+          # Permissao para criar maquinas virtuais
+          PERM=$(az rest --method get --url "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/permissions?api-version=2022-04-01" --query "value[].actions[]" -o tsv 2>/dev/null || true)
+          if [ -z "$PERM" ]; then
+            PODE="nao foi possivel verificar (sera testado ao criar)"
+          elif echo "$PERM" | grep -qxE '\*|Microsoft\.Compute/\*|Microsoft\.Compute/virtualMachines/write'; then
+            PODE="sim"
+          else
+            PODE="nao"
+          fi
+          if [ "$PODE" = "nao" ]; then
+            falha "SEM PERMISSAO PARA CRIAR MAQUINAS VIRTUAIS em $NOME. O dono da assinatura precisa dar o papel Contributor (ou Owner) para $CONTA em portal.azure.com > Assinaturas > Controle de acesso (IAM)."
+          fi
+
           echo "Assinatura em uso: $NOME"
           echo "ASSINATURA=$NOME" >> "$GITHUB_ENV"
+          echo "OFERTA=$QUOTA" >> "$GITHUB_ENV"
+          {
+            echo "## VERIFICACAO DA ASSINATURA"
+            echo "| Item | Valor |"; echo "|---|---|"
+            echo "| Conta autenticada | $CONTA |"
+            echo "| Assinatura | $NOME |"
+            echo "| ID da assinatura | \`$SUB\` |"
+            echo "| Estado | Enabled (ativa) |"
+            echo "| Tipo de oferta | $QUOTA |"
+            echo "| Limite de gasto | $LIMITE |"
+            echo "| Pode criar VMs | $PODE |"
+            echo "| Creditos | $CREDITO |"
+            if [ -n "$NOTA" ]; then echo ""; echo "**Atencao:** $NOTA"; fi
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # ---- 3) PREPARAR: provedores, regiao, GPU e cota ----
       - name: Preparar recursos e verificar GPU / cota
@@ -248,72 +331,4 @@ jobs:
           Y28gKG8gU3Vuc2hpbmUgcHJlY2lzYSBkZSB1bWEgc2Vzc2FvIGFiZXJ0YSBwYXJhIHRyYW5zbWl0
           aXIpCiR3bCA9ICdIS0xNOlxTT0ZUV0FSRVxNaWNyb3NvZnRcV2luZG93cyBOVFxDdXJyZW50VmVy
           c2lvblxXaW5sb2dvbicKU2V0LUl0ZW1Qcm9wZXJ0eSAtUGF0aCAkd2wgLU5hbWUgQXV0b0FkbWlu
-          TG9nb24gLVZhbHVlICcxJwpTZXQtSXRlbVByb3BlcnR5IC1QYXRoICR3bCAtTmFtZSBEZWZhdWx0
-          VXNlck5hbWUgLVZhbHVlICRVc3VhcmlvClNldC1JdGVtUHJvcGVydHkgLVBhdGggJHdsIC1OYW1l
-          IERlZmF1bHRQYXNzd29yZCAtVmFsdWUgJFNlbmhhClNldC1JdGVtUHJvcGVydHkgLVBhdGggJHds
-          IC1OYW1lIERlZmF1bHREb21haW5OYW1lIC1WYWx1ZSAkZW52OkNPTVBVVEVSTkFNRQoKIyAzKSBF
-          bmVyZ2lhOiBzZW0gc3VzcGVuc2FvIGUgc2VtIGRlc2xpZ2FyIHRlbGEvZGlzY28KcG93ZXJjZmcg
-          L3NldGFjdGl2ZSBTQ0hFTUVfTUlOIHwgT3V0LU51bGwKcG93ZXJjZmcgL2NoYW5nZSBzdGFuZGJ5
-          LXRpbWVvdXQtYWMgMApwb3dlcmNmZyAvY2hhbmdlIG1vbml0b3ItdGltZW91dC1hYyAwCnBvd2Vy
-          Y2ZnIC9jaGFuZ2UgZGlzay10aW1lb3V0LWFjIDAKcG93ZXJjZmcgL2hpYmVybmF0ZSBvZmYKCiMg
-          NCkgVGFpbHNjYWxlOiBpbnN0YWxhIGUgYXV0ZW50aWNhIGNvbSBhIGNoYXZlIGRvIEdpdEh1YiBT
-          ZWNyZXQKJG1zaSA9ICdDOlxzZXR1cC1sb2dzXHRhaWxzY2FsZS5tc2knCkludm9rZS1XZWJSZXF1
-          ZXN0IC1VcmkgJ2h0dHBzOi8vcGtncy50YWlsc2NhbGUuY29tL3N0YWJsZS90YWlsc2NhbGUtc2V0
-          dXAtbGF0ZXN0LWFtZDY0Lm1zaScgLU91dEZpbGUgJG1zaSAtVXNlQmFzaWNQYXJzaW5nCiRwID0g
-          U3RhcnQtUHJvY2VzcyBtc2lleGVjLmV4ZSAtQXJndW1lbnRMaXN0ICIvaSBgIiRtc2lgIiAvcXVp
-          ZXQgL25vcmVzdGFydCIgLVdhaXQgLVBhc3NUaHJ1CmlmICgkcC5FeGl0Q29kZSAtbm90aW4gMCwg
-          MzAxMCkgeyB0aHJvdyAiRmFsaGEgYW8gaW5zdGFsYXIgbyBUYWlsc2NhbGUgKGNvZGlnbyAkKCRw
-          LkV4aXRDb2RlKSkiIH0KJHRzID0gJ0M6XFByb2dyYW0gRmlsZXNcVGFpbHNjYWxlXHRhaWxzY2Fs
-          ZS5leGUnCmZvciAoJGkgPSAwOyAkaSAtbHQgMzAgLWFuZCAtbm90IChUZXN0LVBhdGggJHRzKTsg
-          JGkrKykgeyBTdGFydC1TbGVlcCAyIH0KU3RhcnQtU2VydmljZSAtTmFtZSBUYWlsc2NhbGUgLUVy
-          cm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUKU3RhcnQtU2xlZXAgNQoKJiAkdHMgdXAgIi0tYXV0
-          aC1rZXk9JEF1dGhLZXkiICItLWhvc3RuYW1lPSROb21lUEMiIC0tdW5hdHRlbmRlZCAtLXJlc2V0
-          ICo+ICRudWxsCmlmICgkTEFTVEVYSVRDT0RFIC1uZSAwKSB7IHRocm93ICJ0YWlsc2NhbGUgdXAg
-          ZmFsaG91IChjb2RpZ28gJExBU1RFWElUQ09ERSkuIFZlcmlmaXF1ZSBzZSBUQUlMU0NBTEVfQVVU
-          SF9LRVkgZSB2YWxpZGEgZSBuYW8gZXhwaXJvdS4iIH0KJEF1dGhLZXkgPSAkbnVsbAoKJGlwID0g
-          JG51bGwKZm9yICgkaSA9IDA7ICRpIC1sdCA2MCAtYW5kIC1ub3QgJGlwOyAkaSsrKSB7CiAgdHJ5
-          IHsKICAgICRzdCA9ICgmICR0cyBzdGF0dXMgLS1qc29uIHwgQ29udmVydEZyb20tSnNvbikKICAg
-          IGlmICgkc3QuQmFja2VuZFN0YXRlIC1lcSAnUnVubmluZycpIHsgJGlwID0gKCYgJHRzIGlwIC00
-          IHwgU2VsZWN0LU9iamVjdCAtRmlyc3QgMSkgfQogIH0gY2F0Y2gge30KICBpZiAoLW5vdCAkaXAp
-          IHsgU3RhcnQtU2xlZXAgNSB9Cn0KaWYgKC1ub3QgJGlwKSB7IHRocm93ICdPIFRhaWxzY2FsZSBu
-          YW8gY29uZWN0b3UgYSB0ZW1wby4nIH0KTG9nICJUYWlsc2NhbGUgY29uZWN0YWRvOiAkaXAiCgoj
-          IDUpIFN1bnNoaW5lIChzZXJ2aWRvciBkZSBzdHJlYW1pbmcgcGFyYSBvIE1vb25saWdodCkKJHJl
-          bCA9IEludm9rZS1SZXN0TWV0aG9kIC1VcmkgJ2h0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3Mv
-          TGl6YXJkQnl0ZS9TdW5zaGluZS9yZWxlYXNlcy9sYXRlc3QnIC1IZWFkZXJzIEB7ICdVc2VyLUFn
-          ZW50JyA9ICdnYW1lcnBjJyB9CiRhc3NldCA9ICRyZWwuYXNzZXRzIHwgV2hlcmUtT2JqZWN0IHsg
-          JF8ubmFtZSAtbWF0Y2ggJ3dpbmRvd3MnIC1hbmQgJF8ubmFtZSAtbWF0Y2ggJ2luc3RhbGxlclwu
-          ZXhlJCcgLWFuZCAkXy5uYW1lIC1ub3RtYXRjaCAnYXJtJyB9IHwgU2VsZWN0LU9iamVjdCAtRmly
-          c3QgMQppZiAoLW5vdCAkYXNzZXQpIHsgdGhyb3cgJ0luc3RhbGFkb3IgZG8gU3Vuc2hpbmUgbmFv
-          IGVuY29udHJhZG8uJyB9CiRleGUgPSAnQzpcc2V0dXAtbG9nc1xzdW5zaGluZS1pbnN0YWxsZXIu
-          ZXhlJwpJbnZva2UtV2ViUmVxdWVzdCAtVXJpICRhc3NldC5icm93c2VyX2Rvd25sb2FkX3VybCAt
-          T3V0RmlsZSAkZXhlIC1Vc2VCYXNpY1BhcnNpbmcKJHAgPSBTdGFydC1Qcm9jZXNzICRleGUgLUFy
-          Z3VtZW50TGlzdCAnL1MnIC1XYWl0IC1QYXNzVGhydQppZiAoJHAuRXhpdENvZGUgLW5lIDApIHsg
-          TG9nICJBdmlzbzogaW5zdGFsYWRvciBkbyBTdW5zaGluZSByZXRvcm5vdSAkKCRwLkV4aXRDb2Rl
-          KSIgfQoKTmV3LU5ldEZpcmV3YWxsUnVsZSAtRGlzcGxheU5hbWUgJ1N1bnNoaW5lIFRDUCcgLURp
-          cmVjdGlvbiBJbmJvdW5kIC1Qcm90b2NvbCBUQ1AgLUxvY2FsUG9ydCA0Nzk4NCwgNDc5ODksIDQ3
-          OTkwLCA0ODAxMCAtQWN0aW9uIEFsbG93IC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlIHwg
-          T3V0LU51bGwKTmV3LU5ldEZpcmV3YWxsUnVsZSAtRGlzcGxheU5hbWUgJ1N1bnNoaW5lIFVEUCcg
-          LURpcmVjdGlvbiBJbmJvdW5kIC1Qcm90b2NvbCBVRFAgLUxvY2FsUG9ydCA0Nzk5OCwgNDc5OTks
-          IDQ4MDAwLCA0ODAwMiwgNDgwMTAgLUFjdGlvbiBBbGxvdyAtRXJyb3JBY3Rpb24gU2lsZW50bHlD
-          b250aW51ZSB8IE91dC1OdWxsCkxvZyAiU3Vuc2hpbmUgaW5zdGFsYWRvIgoKIyBMb2dpbiBkbyBT
-          dW5zaGluZSA9IG1lc21hIGNvbnRhIGRvIFdpbmRvd3MgKGV2aXRhIGNyaWFyIHVzdWFyaW8gbm8g
-          cGFpbmVsKQokc3VuID0gJ0M6XFByb2dyYW0gRmlsZXNcU3Vuc2hpbmVcc3Vuc2hpbmUuZXhlJwpp
-          ZiAoVGVzdC1QYXRoICRzdW4pIHsKICB0cnkgewogICAgUHVzaC1Mb2NhdGlvbiAnQzpcUHJvZ3Jh
-          bSBGaWxlc1xTdW5zaGluZScKICAgICYgJHN1biAtLWNyZWRzICRVc3VhcmlvICRTZW5oYSAqPiAk
-          bnVsbAogICAgUG9wLUxvY2F0aW9uCiAgICBSZXN0YXJ0LVNlcnZpY2UgLU5hbWUgU3Vuc2hpbmVT
-          ZXJ2aWNlIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCiAgICBMb2cgIkxvZ2luIGRvIFN1
-          bnNoaW5lIGRlZmluaWRvIgogIH0gY2F0Y2ggeyBMb2cgIkF2aXNvOiBuYW8gZm9pIHBvc3NpdmVs
-          IGRlZmluaXIgbyBsb2dpbiBkbyBTdW5zaGluZSIgfQp9CgpMb2cgIlByaW1laXJvIGJvb3QgY29u
-          Y2x1aWRvIgo=
-          B64EOF
-
-          # Senha NAO e mascarada de proposito: ela aparece no resumo final
-          PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
-          echo "pw=$PW" >> "$GITHUB_OUTPUT"
-
-          if [ "$(az group exists -n "$RG")" = true ]; then az group delete -n "$RG" --yes -o none 2>/dev/null; fi
-          az group create -n "$RG" -l "$REG" -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
-
-          az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
-            --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
-            --admin-username "$US
+          TG9nb24gLVZhbHVlICcxJwpTZXQtSXRlbVByb3BlcnR5IC1QY
