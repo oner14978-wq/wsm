@@ -136,11 +136,20 @@ jobs:
               '{name:$n,issuer:"https://token.actions.githubusercontent.com",subject:$s,audiences:["api://AzureADTokenExchange"]}')"
           fi
           SALVO="nao"
-          if [ -n "${GH_TOKEN:-}" ]; then
-            gh secret set AZ_CLIENT_ID --body "$APP" --repo "$REPO"
-            gh secret set AZ_TENANT_ID --body "$TEN" --repo "$REPO"
-            gh secret set AZ_SUBSCRIPTION_ID --body "$SUB" --repo "$REPO"
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::warning::GH_ADMIN_TOKEN nao esta configurado. Os 3 valores do Azure NAO serao salvos sozinhos (veja o Summary)."
+          else
             SALVO="sim"
+            for par in "AZ_CLIENT_ID=$APP" "AZ_TENANT_ID=$TEN" "AZ_SUBSCRIPTION_ID=$SUB"; do
+              nome="${par%%=*}"; valor="${par#*=}"
+              if gh secret set "$nome" --body "$valor" --repo "$REPO" 2>/tmp/gherr; then
+                echo "Secret $nome salvo."
+              else
+                echo "ERRO ao salvar $nome: $(head -c 300 /tmp/gherr)"
+                echo "::warning::Nao consegui salvar $nome. O token GH_ADMIN_TOKEN precisa de permissao Secrets: Read and write neste repositorio."
+                SALVO="nao"
+              fi
+            done
           fi
           {
             echo "## Valores criados do Azure"
@@ -334,15 +343,4 @@ jobs:
           }
           echo "::add-mask::$AUTHKEY"
 
-          SENHA="Aa1-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 16)"
-          echo "::add-mask::$SENHA"
-
-          cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
-          param(
-            [Parameter(Mandatory = $true)][string]$AuthKey,
-            [string]$NomePC = 'gamerpc'
-          )
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-          New-Item -ItemType Directory -Force
+          SE
