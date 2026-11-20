@@ -224,100 +224,88 @@ jobs:
           }
           echo "::add-mask::$AUTHKEY"
 
-          # Script que roda dentro do Windows (sem nenhum segredo dentro)
-          cat > /tmp/primeiro-boot.ps1 <<'PSEOF'
-          param(
-            [Parameter(Mandatory = $true)][string]$AuthKey,
-            [Parameter(Mandatory = $true)][string]$Senha,
-            [string]$NomePC = 'gamerpc',
-            [string]$Usuario = 'Rafael'
-          )
-
-          $ErrorActionPreference = 'Stop'
-          $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-          New-Item -ItemType Directory -Force -Path C:\setup-logs | Out-Null
-          $LogFile = 'C:\setup-logs\primeiro-boot.log'
-          function Log($m) { "$(Get-Date -Format s) $m" | Out-File -FilePath $LogFile -Append -Encoding utf8 }
-          Log "Inicio do primeiro boot (a chave do Tailscale nunca e gravada neste log)"
-
-          # 1) Conta Windows
-          $sec = ConvertTo-SecureString $Senha -AsPlainText -Force
-          if (Get-LocalUser -Name $Usuario -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires $true
-          } else {
-            New-LocalUser -Name $Usuario -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
-          }
-          Add-LocalGroupMember -Group 'Administrators' -Member $Usuario -ErrorAction SilentlyContinue
-          Log "Conta $Usuario pronta"
-
-          # 2) Login automatico (o Sunshine precisa de uma sessao aberta para transmitir)
-          $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
-          Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '1'
-          Set-ItemProperty -Path $wl -Name DefaultUserName -Value $Usuario
-          Set-ItemProperty -Path $wl -Name DefaultPassword -Value $Senha
-          Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
-
-          # 3) Energia: sem suspensao e sem desligar tela/disco
-          powercfg /setactive SCHEME_MIN | Out-Null
-          powercfg /change standby-timeout-ac 0
-          powercfg /change monitor-timeout-ac 0
-          powercfg /change disk-timeout-ac 0
-          powercfg /hibernate off
-
-          # 4) Tailscale: instala e autentica com a chave do GitHub Secret
-          $msi = 'C:\setup-logs\tailscale.msi'
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi -UseBasicParsing
-          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
-          if ($p.ExitCode -notin 0, 3010) { throw "Falha ao instalar o Tailscale (codigo $($p.ExitCode))" }
-          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
-          for ($i = 0; $i -lt 30 -and -not (Test-Path $ts); $i++) { Start-Sleep 2 }
-          Start-Service -Name Tailscale -ErrorAction SilentlyContinue
-          Start-Sleep 5
-
-          & $ts up "--auth-key=$AuthKey" "--hostname=$NomePC" --unattended --reset *> $null
-          if ($LASTEXITCODE -ne 0) { throw "tailscale up falhou (codigo $LASTEXITCODE). Verifique se TAILSCALE_AUTH_KEY e valida e nao expirou." }
-          $AuthKey = $null
-
-          $ip = $null
-          for ($i = 0; $i -lt 60 -and -not $ip; $i++) {
-            try {
-              $st = (& $ts status --json | ConvertFrom-Json)
-              if ($st.BackendState -eq 'Running') { $ip = (& $ts ip -4 | Select-Object -First 1) }
-            } catch {}
-            if (-not $ip) { Start-Sleep 5 }
-          }
-          if (-not $ip) { throw 'O Tailscale nao conectou a tempo.' }
-          Log "Tailscale conectado: $ip"
-
-          # 5) Sunshine (servidor de streaming para o Moonlight)
-          $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest' -Headers @{ 'User-Agent' = 'gamerpc' }
-          $asset = $rel.assets | Where-Object { $_.name -match 'windows' -and $_.name -match 'installer\.exe$' -and $_.name -notmatch 'arm' } | Select-Object -First 1
-          if (-not $asset) { throw 'Instalador do Sunshine nao encontrado.' }
-          $exe = 'C:\setup-logs\sunshine-installer.exe'
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe -UseBasicParsing
-          $p = Start-Process $exe -ArgumentList '/S' -Wait -PassThru
-          if ($p.ExitCode -ne 0) { Log "Aviso: instalador do Sunshine retornou $($p.ExitCode)" }
-
-          New-NetFirewallRule -DisplayName 'Sunshine TCP' -Direction Inbound -Protocol TCP -LocalPort 47984, 47989, 47990, 48010 -Action Allow -ErrorAction SilentlyContinue | Out-Null
-          New-NetFirewallRule -DisplayName 'Sunshine UDP' -Direction Inbound -Protocol UDP -LocalPort 47998, 47999, 48000, 48002, 48010 -Action Allow -ErrorAction SilentlyContinue | Out-Null
-          Log "Sunshine instalado"
-
-          # Login do Sunshine = mesma conta do Windows (evita criar usuario no painel)
-          $sun = 'C:\Program Files\Sunshine\sunshine.exe'
-          if (Test-Path $sun) {
-            try {
-              Push-Location 'C:\Program Files\Sunshine'
-              & $sun --creds $Usuario $Senha *> $null
-              Pop-Location
-              Restart-Service -Name SunshineService -ErrorAction SilentlyContinue
-              Log "Login do Sunshine definido"
-            } catch { Log "Aviso: nao foi possivel definir o login do Sunshine" }
-          }
-
-          Log "Primeiro boot concluido"
-          PSEOF
+          # Script que roda dentro do Windows (embutido em base64, sem nenhum segredo)
+          base64 -d > /tmp/primeiro-boot.ps1 <<'B64EOF'
+          cGFyYW0oCiAgW1BhcmFtZXRlcihNYW5kYXRvcnkgPSAkdHJ1ZSldW3N0cmluZ10kQXV0aEtleSwK
+          ICBbUGFyYW1ldGVyKE1hbmRhdG9yeSA9ICR0cnVlKV1bc3RyaW5nXSRTZW5oYSwKICBbc3RyaW5n
+          XSROb21lUEMgPSAnZ2FtZXJwYycsCiAgW3N0cmluZ10kVXN1YXJpbyA9ICdSYWZhZWwnCikKCiRF
+          cnJvckFjdGlvblByZWZlcmVuY2UgPSAnU3RvcCcKJFByb2dyZXNzUHJlZmVyZW5jZSA9ICdTaWxl
+          bnRseUNvbnRpbnVlJwpbTmV0LlNlcnZpY2VQb2ludE1hbmFnZXJdOjpTZWN1cml0eVByb3RvY29s
+          ID0gW05ldC5TZWN1cml0eVByb3RvY29sVHlwZV06OlRsczEyCgpOZXctSXRlbSAtSXRlbVR5cGUg
+          RGlyZWN0b3J5IC1Gb3JjZSAtUGF0aCBDOlxzZXR1cC1sb2dzIHwgT3V0LU51bGwKJExvZ0ZpbGUg
+          PSAnQzpcc2V0dXAtbG9nc1xwcmltZWlyby1ib290LmxvZycKZnVuY3Rpb24gTG9nKCRtKSB7ICIk
+          KEdldC1EYXRlIC1Gb3JtYXQgcykgJG0iIHwgT3V0LUZpbGUgLUZpbGVQYXRoICRMb2dGaWxlIC1B
+          cHBlbmQgLUVuY29kaW5nIHV0ZjggfQpMb2cgIkluaWNpbyBkbyBwcmltZWlybyBib290IChhIGNo
+          YXZlIGRvIFRhaWxzY2FsZSBudW5jYSBlIGdyYXZhZGEgbmVzdGUgbG9nKSIKCiMgMSkgQ29udGEg
+          V2luZG93cwokc2VjID0gQ29udmVydFRvLVNlY3VyZVN0cmluZyAkU2VuaGEgLUFzUGxhaW5UZXh0
+          IC1Gb3JjZQppZiAoR2V0LUxvY2FsVXNlciAtTmFtZSAkVXN1YXJpbyAtRXJyb3JBY3Rpb24gU2ls
+          ZW50bHlDb250aW51ZSkgewogIFNldC1Mb2NhbFVzZXIgLU5hbWUgJFVzdWFyaW8gLVBhc3N3b3Jk
+          ICRzZWMgLVBhc3N3b3JkTmV2ZXJFeHBpcmVzICR0cnVlCn0gZWxzZSB7CiAgTmV3LUxvY2FsVXNl
+          ciAtTmFtZSAkVXN1YXJpbyAtUGFzc3dvcmQgJHNlYyAtUGFzc3dvcmROZXZlckV4cGlyZXMgLUFj
+          Y291bnROZXZlckV4cGlyZXMgfCBPdXQtTnVsbAp9CkFkZC1Mb2NhbEdyb3VwTWVtYmVyIC1Hcm91
+          cCAnQWRtaW5pc3RyYXRvcnMnIC1NZW1iZXIgJFVzdWFyaW8gLUVycm9yQWN0aW9uIFNpbGVudGx5
+          Q29udGludWUKTG9nICJDb250YSAkVXN1YXJpbyBwcm9udGEiCgojIDIpIExvZ2luIGF1dG9tYXRp
+          Y28gKG8gU3Vuc2hpbmUgcHJlY2lzYSBkZSB1bWEgc2Vzc2FvIGFiZXJ0YSBwYXJhIHRyYW5zbWl0
+          aXIpCiR3bCA9ICdIS0xNOlxTT0ZUV0FSRVxNaWNyb3NvZnRcV2luZG93cyBOVFxDdXJyZW50VmVy
+          c2lvblxXaW5sb2dvbicKU2V0LUl0ZW1Qcm9wZXJ0eSAtUGF0aCAkd2wgLU5hbWUgQXV0b0FkbWlu
+          TG9nb24gLVZhbHVlICcxJwpTZXQtSXRlbVByb3BlcnR5IC1QYXRoICR3bCAtTmFtZSBEZWZhdWx0
+          VXNlck5hbWUgLVZhbHVlICRVc3VhcmlvClNldC1JdGVtUHJvcGVydHkgLVBhdGggJHdsIC1OYW1l
+          IERlZmF1bHRQYXNzd29yZCAtVmFsdWUgJFNlbmhhClNldC1JdGVtUHJvcGVydHkgLVBhdGggJHds
+          IC1OYW1lIERlZmF1bHREb21haW5OYW1lIC1WYWx1ZSAkZW52OkNPTVBVVEVSTkFNRQoKIyAzKSBF
+          bmVyZ2lhOiBzZW0gc3VzcGVuc2FvIGUgc2VtIGRlc2xpZ2FyIHRlbGEvZGlzY28KcG93ZXJjZmcg
+          L3NldGFjdGl2ZSBTQ0hFTUVfTUlOIHwgT3V0LU51bGwKcG93ZXJjZmcgL2NoYW5nZSBzdGFuZGJ5
+          LXRpbWVvdXQtYWMgMApwb3dlcmNmZyAvY2hhbmdlIG1vbml0b3ItdGltZW91dC1hYyAwCnBvd2Vy
+          Y2ZnIC9jaGFuZ2UgZGlzay10aW1lb3V0LWFjIDAKcG93ZXJjZmcgL2hpYmVybmF0ZSBvZmYKCiMg
+          NCkgVGFpbHNjYWxlOiBpbnN0YWxhIGUgYXV0ZW50aWNhIGNvbSBhIGNoYXZlIGRvIEdpdEh1YiBT
+          ZWNyZXQKJG1zaSA9ICdDOlxzZXR1cC1sb2dzXHRhaWxzY2FsZS5tc2knCkludm9rZS1XZWJSZXF1
+          ZXN0IC1VcmkgJ2h0dHBzOi8vcGtncy50YWlsc2NhbGUuY29tL3N0YWJsZS90YWlsc2NhbGUtc2V0
+          dXAtbGF0ZXN0LWFtZDY0Lm1zaScgLU91dEZpbGUgJG1zaSAtVXNlQmFzaWNQYXJzaW5nCiRwID0g
+          U3RhcnQtUHJvY2VzcyBtc2lleGVjLmV4ZSAtQXJndW1lbnRMaXN0ICIvaSBgIiRtc2lgIiAvcXVp
+          ZXQgL25vcmVzdGFydCIgLVdhaXQgLVBhc3NUaHJ1CmlmICgkcC5FeGl0Q29kZSAtbm90aW4gMCwg
+          MzAxMCkgeyB0aHJvdyAiRmFsaGEgYW8gaW5zdGFsYXIgbyBUYWlsc2NhbGUgKGNvZGlnbyAkKCRw
+          LkV4aXRDb2RlKSkiIH0KJHRzID0gJ0M6XFByb2dyYW0gRmlsZXNcVGFpbHNjYWxlXHRhaWxzY2Fs
+          ZS5leGUnCmZvciAoJGkgPSAwOyAkaSAtbHQgMzAgLWFuZCAtbm90IChUZXN0LVBhdGggJHRzKTsg
+          JGkrKykgeyBTdGFydC1TbGVlcCAyIH0KU3RhcnQtU2VydmljZSAtTmFtZSBUYWlsc2NhbGUgLUVy
+          cm9yQWN0aW9uIFNpbGVudGx5Q29udGludWUKU3RhcnQtU2xlZXAgNQoKJiAkdHMgdXAgIi0tYXV0
+          aC1rZXk9JEF1dGhLZXkiICItLWhvc3RuYW1lPSROb21lUEMiIC0tdW5hdHRlbmRlZCAtLXJlc2V0
+          ICo+ICRudWxsCmlmICgkTEFTVEVYSVRDT0RFIC1uZSAwKSB7IHRocm93ICJ0YWlsc2NhbGUgdXAg
+          ZmFsaG91IChjb2RpZ28gJExBU1RFWElUQ09ERSkuIFZlcmlmaXF1ZSBzZSBUQUlMU0NBTEVfQVVU
+          SF9LRVkgZSB2YWxpZGEgZSBuYW8gZXhwaXJvdS4iIH0KJEF1dGhLZXkgPSAkbnVsbAoKJGlwID0g
+          JG51bGwKZm9yICgkaSA9IDA7ICRpIC1sdCA2MCAtYW5kIC1ub3QgJGlwOyAkaSsrKSB7CiAgdHJ5
+          IHsKICAgICRzdCA9ICgmICR0cyBzdGF0dXMgLS1qc29uIHwgQ29udmVydEZyb20tSnNvbikKICAg
+          IGlmICgkc3QuQmFja2VuZFN0YXRlIC1lcSAnUnVubmluZycpIHsgJGlwID0gKCYgJHRzIGlwIC00
+          IHwgU2VsZWN0LU9iamVjdCAtRmlyc3QgMSkgfQogIH0gY2F0Y2gge30KICBpZiAoLW5vdCAkaXAp
+          IHsgU3RhcnQtU2xlZXAgNSB9Cn0KaWYgKC1ub3QgJGlwKSB7IHRocm93ICdPIFRhaWxzY2FsZSBu
+          YW8gY29uZWN0b3UgYSB0ZW1wby4nIH0KTG9nICJUYWlsc2NhbGUgY29uZWN0YWRvOiAkaXAiCgoj
+          IDUpIFN1bnNoaW5lIChzZXJ2aWRvciBkZSBzdHJlYW1pbmcgcGFyYSBvIE1vb25saWdodCkKJHJl
+          bCA9IEludm9rZS1SZXN0TWV0aG9kIC1VcmkgJ2h0dHBzOi8vYXBpLmdpdGh1Yi5jb20vcmVwb3Mv
+          TGl6YXJkQnl0ZS9TdW5zaGluZS9yZWxlYXNlcy9sYXRlc3QnIC1IZWFkZXJzIEB7ICdVc2VyLUFn
+          ZW50JyA9ICdnYW1lcnBjJyB9CiRhc3NldCA9ICRyZWwuYXNzZXRzIHwgV2hlcmUtT2JqZWN0IHsg
+          JF8ubmFtZSAtbWF0Y2ggJ3dpbmRvd3MnIC1hbmQgJF8ubmFtZSAtbWF0Y2ggJ2luc3RhbGxlclwu
+          ZXhlJCcgLWFuZCAkXy5uYW1lIC1ub3RtYXRjaCAnYXJtJyB9IHwgU2VsZWN0LU9iamVjdCAtRmly
+          c3QgMQppZiAoLW5vdCAkYXNzZXQpIHsgdGhyb3cgJ0luc3RhbGFkb3IgZG8gU3Vuc2hpbmUgbmFv
+          IGVuY29udHJhZG8uJyB9CiRleGUgPSAnQzpcc2V0dXAtbG9nc1xzdW5zaGluZS1pbnN0YWxsZXIu
+          ZXhlJwpJbnZva2UtV2ViUmVxdWVzdCAtVXJpICRhc3NldC5icm93c2VyX2Rvd25sb2FkX3VybCAt
+          T3V0RmlsZSAkZXhlIC1Vc2VCYXNpY1BhcnNpbmcKJHAgPSBTdGFydC1Qcm9jZXNzICRleGUgLUFy
+          Z3VtZW50TGlzdCAnL1MnIC1XYWl0IC1QYXNzVGhydQppZiAoJHAuRXhpdENvZGUgLW5lIDApIHsg
+          TG9nICJBdmlzbzogaW5zdGFsYWRvciBkbyBTdW5zaGluZSByZXRvcm5vdSAkKCRwLkV4aXRDb2Rl
+          KSIgfQoKTmV3LU5ldEZpcmV3YWxsUnVsZSAtRGlzcGxheU5hbWUgJ1N1bnNoaW5lIFRDUCcgLURp
+          cmVjdGlvbiBJbmJvdW5kIC1Qcm90b2NvbCBUQ1AgLUxvY2FsUG9ydCA0Nzk4NCwgNDc5ODksIDQ3
+          OTkwLCA0ODAxMCAtQWN0aW9uIEFsbG93IC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlIHwg
+          T3V0LU51bGwKTmV3LU5ldEZpcmV3YWxsUnVsZSAtRGlzcGxheU5hbWUgJ1N1bnNoaW5lIFVEUCcg
+          LURpcmVjdGlvbiBJbmJvdW5kIC1Qcm90b2NvbCBVRFAgLUxvY2FsUG9ydCA0Nzk5OCwgNDc5OTks
+          IDQ4MDAwLCA0ODAwMiwgNDgwMTAgLUFjdGlvbiBBbGxvdyAtRXJyb3JBY3Rpb24gU2lsZW50bHlD
+          b250aW51ZSB8IE91dC1OdWxsCkxvZyAiU3Vuc2hpbmUgaW5zdGFsYWRvIgoKIyBMb2dpbiBkbyBT
+          dW5zaGluZSA9IG1lc21hIGNvbnRhIGRvIFdpbmRvd3MgKGV2aXRhIGNyaWFyIHVzdWFyaW8gbm8g
+          cGFpbmVsKQokc3VuID0gJ0M6XFByb2dyYW0gRmlsZXNcU3Vuc2hpbmVcc3Vuc2hpbmUuZXhlJwpp
+          ZiAoVGVzdC1QYXRoICRzdW4pIHsKICB0cnkgewogICAgUHVzaC1Mb2NhdGlvbiAnQzpcUHJvZ3Jh
+          bSBGaWxlc1xTdW5zaGluZScKICAgICYgJHN1biAtLWNyZWRzICRVc3VhcmlvICRTZW5oYSAqPiAk
+          bnVsbAogICAgUG9wLUxvY2F0aW9uCiAgICBSZXN0YXJ0LVNlcnZpY2UgLU5hbWUgU3Vuc2hpbmVT
+          ZXJ2aWNlIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCiAgICBMb2cgIkxvZ2luIGRvIFN1
+          bnNoaW5lIGRlZmluaWRvIgogIH0gY2F0Y2ggeyBMb2cgIkF2aXNvOiBuYW8gZm9pIHBvc3NpdmVs
+          IGRlZmluaXIgbyBsb2dpbiBkbyBTdW5zaGluZSIgfQp9CgpMb2cgIlByaW1laXJvIGJvb3QgY29u
+          Y2x1aWRvIgo=
+          B64EOF
 
           # Senha NAO e mascarada de proposito: ela aparece no resumo final
           PW="$(openssl rand -base64 12 | tr '+/' '-_')aA1!"
@@ -328,26 +316,4 @@ jobs:
 
           az vm create -g "$RG" -n "$VM" --computer-name GAMERPC --size "$TAM" \
             --image MicrosoftWindowsDesktop:windows-11:win11-24h2-ent:latest \
-            --admin-username "$USUARIO" --admin-password "$PW" \
-            --os-disk-size-gb 240 --storage-sku Premium_LRS --license-type Windows_Client \
-            --public-ip-sku Standard --nsg-rule NONE \
-            --custom-data /tmp/primeiro-boot.ps1 -o none 2>/tmp/err || falha "$(traduz "$(cat /tmp/err)")"
-
-          if [[ "$TAM" == *NV* ]]; then
-            az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.HpcCompute \
-              --name NvidiaGpuDriverWindows --version 1.6 -o none 2>/tmp/err \
-              || echo "::warning::Driver NVIDIA nao instalou: $(tail -c 300 /tmp/err)"
-          fi
-
-          # A chave e a senha vao em protected-settings (criptografado, nao aparece em logs nem no portal)
-          CMD="powershell -ExecutionPolicy Bypass -Command \"Copy-Item C:\\AzureData\\CustomData.bin C:\\setup.ps1 -Force; & C:\\setup.ps1 -AuthKey '$AUTHKEY' -NomePC '$VM' -Usuario '$USUARIO' -Senha '$PW'\""
-          PS=$(jq -nc --arg c "$CMD" '{commandToExecute:$c}')
-          echo "::add-mask::$PS"
-          az vm extension set -g "$RG" --vm-name "$VM" --publisher Microsoft.Compute \
-            --name CustomScriptExtension --version 1.10 \
-            --protected-settings "$PS" -o none 2>/tmp/err \
-            || falha "O script de primeiro boot falhou dentro do Windows. A causa mais comum e TAILSCALE_AUTH_KEY invalida ou expirada (gere outra no painel do Tailscale). Logs na VM: C:\\setup-logs\\primeiro-boot.log"
-
-      # ---- 5) LIGAR / DESLIGAR / REINICIAR / DESTRUIR ----
-      - name: Ligar, desligar, reiniciar ou destruir
-        if: contains('ligar desligar 
+            --admin-username "$US
